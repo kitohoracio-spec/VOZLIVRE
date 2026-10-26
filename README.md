@@ -1,39 +1,23 @@
-# VozLivre — protótipo Android
+# VozLivre — protótipo Android com Wi-Fi Direct
 
-Protótipo inicial de chamadas de voz locais entre dispositivos Android ligados à mesma rede Wi-Fi, sem necessidade de Internet.
+Esta versão experimental mantém o modo de rede Wi-Fi existente e acrescenta uma primeira integração com Wi-Fi Direct para procurar e ligar dois telemóveis Android sem router nem Internet.
 
-## Funcionalidades deste protótipo
-- Descoberta automática por broadcast UDP na rede local.
-- Criar/participar informalmente numa sala ao manter a aplicação aberta.
-- Chamada individual, atender/rejeitar e terminar.
-- Áudio bidirecional PCM de baixa latência via UDP na rede local.
+## Como testar
+1. Instala o APK nos dois telemóveis Android.
+2. Ativa o Wi-Fi nos dois aparelhos (não é necessário ligar a um router).
+3. Abre VozLivre e permite o microfone e a localização quando o Android pedir. A permissão de localização é exigida por versões antigas do Android para descobrir dispositivos Wi-Fi Direct.
+4. Nos dois telemóveis, toca em **Procurar telemóveis (Wi-Fi Direct)**.
+5. Quando aparecer o outro telemóvel, toca em **Ligar por Wi-Fi Direct** num dos aparelhos e aceita os pedidos de ligação que o Android apresentar.
+6. Depois de a ligação direta estar estabelecida, espera que os nomes apareçam na lista e toca em **Ligar** para iniciar a chamada.
 
 ## Limitações importantes
-- É um protótipo experimental, não uma aplicação pronta para distribuição.
-- A descoberta depende de a rede Wi-Fi permitir broadcast entre clientes. Desative “AP/client isolation” no router se existir.
-- A transmissão de áudio não é encriptada nesta versão; utilize apenas numa rede de teste confiável. Não use para conversas privadas.
-- O áudio PCM consome mais largura de banda do que codecs como Opus e a qualidade/latência dependem do router e dos dispositivos.
-- Esta primeira versão não foi validada em dispositivos físicos neste ambiente. Podem ser necessários ajustes para fabricantes Android específicos.
-- O protótipo foi desenhado para uma chamada individual por dispositivo de cada vez; não é ainda uma solução de conferência.
-- A aplicação deve permanecer aberta durante os testes. Não há suporte completo para chamadas em segundo plano.
+- Esta é uma versão experimental; a descoberta P2P e o áudio precisam de ser validados em dois dispositivos físicos. Fabricantes e versões de Android podem apresentar comportamentos diferentes.
+- Wi-Fi Direct não garante um alcance específico. Mais de 500 metros não é uma expectativa realista entre telemóveis comuns; será necessário equipamento de rádio Wi-Fi de longo alcance e linha de vista para essa fase.
+- O áudio e os comandos desta versão não são encriptados. Usa apenas para testes, não para conversas privadas.
+- A app deve permanecer aberta durante os testes. Não inclui suporte completo para chamadas em segundo plano.
+- O áudio usa PCM16 mono a 16 kHz via UDP. A qualidade depende dos aparelhos e da ligação.
 
-## Compilar APK sem computador local
-1. Crie um repositório GitHub e carregue todos os ficheiros deste projeto.
-2. No GitHub, abra **Actions** e execute **Build VozLivre APK** (ou faça push para `main`).
-3. Abra a execução concluída e descarregue o artefacto `VozLivre-debug-apk`.
-4. Extraia o ZIP do artefacto para obter `app-debug.apk`.
-5. Instale o APK nos dois Androids e permita acesso ao microfone.
-
-## Testar
-1. Ligue ambos os telemóveis ao mesmo router Wi-Fi.
-2. O router pode estar sem Internet, mas deve permitir comunicação entre clientes.
-3. Abra VozLivre nos dois dispositivos e permita o microfone.
-4. Defina nomes diferentes e aguarde alguns segundos para aparecerem na lista.
-5. Toque em **Ligar** num dispositivo e aceite a chamada no outro.
-
-## Portas locais
-- UDP 39871: descoberta e sinalização.
-- UDP 39872: áudio PCM.
-
-## Privacidade
-Esta versão transmite áudio sem criptografia. Não a utilize para dados sensíveis. Uma versão pública deve adicionar autenticação, criptografia, tratamento robusto de perda de pacotes e testes de segurança.
+## Compilar APK com GitHub Actions
+1. Carrega o conteúdo desta pasta para o repositório GitHub, mantendo a estrutura dos ficheiros.
+2. Abre **Actions** e executa **Build VozLivre APK** ou faz push para `main`.
+3. Descarrega o artefacto `VozLivre-debug-apk` da execução concluída e extrai `app-debug.apk`.

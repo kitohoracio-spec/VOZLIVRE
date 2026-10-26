@@ -3,6 +3,9 @@ package com.vozlivre.app
 import android.Manifest
 import android.app.Activity
 import android.content.Context
+import android.content.BroadcastReceiver
+import android.content.Intent
+import android.content.IntentFilter
 import android.content.pm.PackageManager
 import android.media.AudioFormat
 import android.media.AudioManager
@@ -10,6 +13,11 @@ import android.media.AudioRecord
 import android.media.AudioTrack
 import android.media.MediaRecorder
 import android.net.wifi.WifiManager
+import android.net.wifi.p2p.WifiP2pConfig
+import android.net.wifi.p2p.WifiP2pDevice
+import android.net.wifi.p2p.WifiP2pDeviceList
+import android.net.wifi.p2p.WifiP2pInfo
+import android.net.wifi.p2p.WifiP2pManager
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
@@ -49,21 +57,32 @@ class MainActivity : Activity() {
     private var receiveAudioThread: Thread? = null
     private var sendAudioThread: Thread? = null
     private var wifiLock: WifiManager.MulticastLock? = null
+    private var p2pManager: WifiP2pManager? = null
+    private var p2pChannel: WifiP2pManager.Channel? = null
+    private var p2pReceiver: BroadcastReceiver? = null
+    private var p2pRegistered = false
+    private var p2pConnected = false
+    private var p2pGroupOwner = false
+    private var p2pOwnerAddress: InetAddress? = null
+    private val p2pDevices = LinkedHashMap<String, WifiP2pDevice>()
 
     private lateinit var root: LinearLayout
     private lateinit var status: TextView
     private lateinit var peerList: LinearLayout
     private lateinit var nameInput: EditText
     private lateinit var callStatus: TextView
+    private lateinit var p2pStatus: TextView
 
     data class Peer(val name: String, val ip: String, val port: Int = 39871, val seenAt: Long = System.currentTimeMillis())
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         buildUi()
-        if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
-            requestPermissions(arrayOf(Manifest.permission.RECORD_AUDIO), 10)
-        } else startLocalNetwork()
+        setupWifiDirectReceiver()
+        val needed = mutableListOf<String>()
+        if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) needed.add(Manifest.permission.RECORD_AUDIO)
+        if (checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED) needed.add(Manifest.permission.ACCESS_FINE_LOCATION)
+        if (needed.isNotEmpty()) requestPermissions(needed.toTypedArray(), 10) else startLocalNetwork()
     }
 
     private fun buildUi() {
@@ -114,12 +133,22 @@ class MainActivity : Activity() {
             setTextColor(0xFFFFFFFF.toInt())
             setPadding(0, 8, 0, 8)
         }
+        val p2pButton = Button(this).apply {
+            text = "Procurar telemóveis (Wi-Fi Direct)"
+            setOnClickListener { discoverP2pPeers() }
+        }
+        p2pStatus = TextView(this).apply {
+            text = "Wi-Fi Direct: ainda não ligado"
+            textSize = 14f
+            setTextColor(0xFFD2E2D7.toInt())
+            setPadding(0, 8, 0, 8)
+        }
         val hangup = Button(this).apply {
             text = "Terminar chamada"
             setOnClickListener { endCall("Chamada terminada") }
         }
         val section = TextView(this).apply {
-            text = "Pessoas encontradas na rede"
+            text = "Telemóveis Wi-Fi Direct / pessoas na rede"
             textSize = 18f
             setTextColor(0xFFFFFFFF.toInt())
             setPadding(0, 18, 0, 8)
@@ -132,6 +161,8 @@ class MainActivity : Activity() {
         root.addView(saveName)
         root.addView(status)
         root.addView(callStatus)
+        root.addView(p2pButton)
+        root.addView(p2pStatus)
         root.addView(hangup)
         root.addView(section)
         root.addView(scroll, LinearLayout.LayoutParams(-1, 0, 1f))
@@ -140,10 +171,107 @@ class MainActivity : Activity() {
 
     override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
-        if (requestCode == 10 && grantResults.isNotEmpty() && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
-            startLocalNetwork()
+        if (requestCode == 11) {
+            if (checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED) discoverP2pPeers()
+            else p2pStatus.text = "A permissão é necessária para procurar dispositivos Wi-Fi Direct."
+            return
+        }
+        if (requestCode == 10) {
+            val audioGranted = checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
+            if (audioGranted) startLocalNetwork()
+            else status.text = "É necessário permitir o microfone para chamadas."
+            if (checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED) {
+                p2pStatus.text = "Permite a localização para procurar dispositivos Wi-Fi Direct (o Android exige esta permissão)."
+            }
+        }
+    }
+
+    private fun setupWifiDirectReceiver() {
+        p2pManager = getSystemService(Context.WIFI_P2P_SERVICE) as? WifiP2pManager
+        p2pChannel = p2pManager?.initialize(this, mainLooper, null)
+        val filter = IntentFilter().apply {
+            addAction(WifiP2pManager.WIFI_P2P_STATE_CHANGED_ACTION)
+            addAction(WifiP2pManager.WIFI_P2P_PEERS_CHANGED_ACTION)
+            addAction(WifiP2pManager.WIFI_P2P_CONNECTION_CHANGED_ACTION)
+            addAction(WifiP2pManager.WIFI_P2P_THIS_DEVICE_CHANGED_ACTION)
+        }
+        p2pReceiver = object : BroadcastReceiver() {
+            override fun onReceive(context: Context, intent: Intent) {
+                when (intent.action) {
+                    WifiP2pManager.WIFI_P2P_STATE_CHANGED_ACTION -> {
+                        val enabled = intent.getIntExtra(WifiP2pManager.EXTRA_WIFI_STATE, -1) == WifiP2pManager.WIFI_P2P_STATE_ENABLED
+                        mainHandler.post { p2pStatus.text = if (enabled) "Wi-Fi Direct disponível. Toca em Procurar." else "Ativa o Wi-Fi nas definições do telemóvel." }
+                    }
+                    WifiP2pManager.WIFI_P2P_PEERS_CHANGED_ACTION -> requestP2pPeers()
+                    WifiP2pManager.WIFI_P2P_CONNECTION_CHANGED_ACTION -> {
+                        val manager = p2pManager ?: return
+                        val channel = p2pChannel ?: return
+                        manager.requestConnectionInfo(channel) { info -> handleP2pConnection(info) }
+                    }
+                }
+            }
+        }
+        try {
+            registerReceiver(p2pReceiver, filter)
+            p2pRegistered = true
+        } catch (_: Exception) { }
+    }
+
+    private fun discoverP2pPeers() {
+        if (checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED) {
+            requestPermissions(arrayOf(Manifest.permission.ACCESS_FINE_LOCATION), 11)
+            return
+        }
+        val manager = p2pManager
+        val channel = p2pChannel
+        if (manager == null || channel == null) {
+            p2pStatus.text = "Este telemóvel não disponibiliza Wi-Fi Direct."
+            return
+        }
+        p2pStatus.text = "A procurar telemóveis próximos... mantém o Wi-Fi ligado nos dois."
+        manager.discoverPeers(channel, object : WifiP2pManager.ActionListener {
+            override fun onSuccess() { mainHandler.post { p2pStatus.text = "Procura iniciada. Escolhe um telemóvel na lista abaixo." } }
+            override fun onFailure(reason: Int) { mainHandler.post { p2pStatus.text = "Falha na procura Wi-Fi Direct (código $reason). Confirma que o Wi-Fi está ligado." } }
+        })
+    }
+
+    private fun requestP2pPeers() {
+        val manager = p2pManager ?: return
+        val channel = p2pChannel ?: return
+        manager.requestPeers(channel) { list: WifiP2pDeviceList ->
+            p2pDevices.clear()
+            list.deviceList.forEach { device -> p2pDevices[device.deviceAddress] = device }
+            mainHandler.post { refreshPeers() }
+        }
+    }
+
+    private fun connectP2pDevice(device: WifiP2pDevice) {
+        val manager = p2pManager ?: return
+        val channel = p2pChannel ?: return
+        val config = WifiP2pConfig().apply { deviceAddress = device.deviceAddress }
+        p2pStatus.text = "A ligar a ${device.deviceName ?: "telemóvel"}... aceita o pedido no outro dispositivo se aparecer."
+        manager.connect(channel, config, object : WifiP2pManager.ActionListener {
+            override fun onSuccess() { mainHandler.post { p2pStatus.text = "Pedido de ligação enviado para ${device.deviceName}." } }
+            override fun onFailure(reason: Int) { mainHandler.post { p2pStatus.text = "Não foi possível ligar (código $reason). Tenta procurar novamente." } }
+        })
+    }
+
+    private fun handleP2pConnection(info: WifiP2pInfo) {
+        p2pConnected = info.groupFormed
+        p2pGroupOwner = info.isGroupOwner
+        p2pOwnerAddress = info.groupOwnerAddress
+        if (info.groupFormed) {
+            mainHandler.post {
+                p2pStatus.text = if (info.isGroupOwner) "Wi-Fi Direct ligado. Este telemóvel criou o grupo." else "Wi-Fi Direct ligado ao outro telemóvel."
+                status.text = "Ligação direta ativa; a procurar o outro utilizador..."
+            }
+            // Give Android a moment to configure the P2P network interface, then announce presence.
+            thread {
+                Thread.sleep(1200)
+                repeat(3) { broadcastHello(); Thread.sleep(500) }
+            }
         } else {
-            status.text = "É necessário permitir o microfone para chamadas."
+            mainHandler.post { p2pStatus.text = "Wi-Fi Direct: desligado" }
         }
     }
 
@@ -191,6 +319,12 @@ class MainActivity : Activity() {
             val data = msg.toByteArray(Charsets.UTF_8)
             val address = InetAddress.getByName("255.255.255.255")
             socket.send(DatagramPacket(data, data.size, address, controlPort))
+            if (p2pConnected) {
+                try {
+                    socket.send(DatagramPacket(data, data.size, InetAddress.getByName("192.168.49.255"), controlPort))
+                    if (!p2pGroupOwner) p2pOwnerAddress?.let { socket.send(DatagramPacket(data, data.size, it, controlPort)) }
+                } catch (_: Exception) { }
+            }
         } catch (_: Exception) {}
     }
 
@@ -260,9 +394,29 @@ class MainActivity : Activity() {
 
     private fun refreshPeers() {
         peerList.removeAllViews()
-        if (peers.isEmpty()) {
+        p2pDevices.values.forEach { device ->
+            val row = LinearLayout(this).apply {
+                orientation = LinearLayout.VERTICAL
+                setPadding(14, 12, 14, 12)
+                setBackgroundColor(0xFF263A48.toInt())
+            }
+            val label = TextView(this).apply {
+                text = "${device.deviceName ?: "Telemóvel sem nome"}\nWi-Fi Direct • ${p2pStatusText(device.status)}"
+                textSize = 16f
+                setTextColor(0xFFFFFFFF.toInt())
+            }
+            val connect = Button(this).apply {
+                text = if (device.status == WifiP2pDevice.CONNECTED) "Ligado" else "Ligar por Wi-Fi Direct"
+                isEnabled = device.status != WifiP2pDevice.CONNECTED && !inCall
+                setOnClickListener { connectP2pDevice(device) }
+            }
+            row.addView(label); row.addView(connect)
+            val lp = LinearLayout.LayoutParams(-1, -2); lp.bottomMargin = 12
+            peerList.addView(row, lp)
+        }
+        if (peers.isEmpty() && p2pDevices.isEmpty()) {
             peerList.addView(TextView(this).apply {
-                text = "Ainda não foram encontrados utilizadores. Mantém a aplicação aberta nos dois telemóveis e confirma que estão na mesma rede Wi-Fi."
+                text = "Ainda não foram encontrados utilizadores. Para Wi-Fi Direct, toca em Procurar nos dois telemóveis. Para a rede antiga, ambos devem estar na mesma rede Wi-Fi."
                 setTextColor(0xFFB8C7BD.toInt())
                 textSize = 14f
                 setPadding(0, 10, 0, 10)
@@ -291,6 +445,15 @@ class MainActivity : Activity() {
             lp.bottomMargin = 12
             peerList.addView(row, lp)
         }
+    }
+
+    private fun p2pStatusText(value: Int): String = when (value) {
+        WifiP2pDevice.AVAILABLE -> "disponível"
+        WifiP2pDevice.INVITED -> "convite enviado"
+        WifiP2pDevice.CONNECTED -> "conectado"
+        WifiP2pDevice.FAILED -> "falhou"
+        WifiP2pDevice.UNAVAILABLE -> "indisponível"
+        else -> "estado desconhecido"
     }
 
     private fun callPeer(peer: Peer) {
@@ -414,6 +577,7 @@ class MainActivity : Activity() {
         try { controlSocket?.close() } catch (_: Exception) {}
         try { audioSocket?.close() } catch (_: Exception) {}
         try { wifiLock?.release() } catch (_: Exception) {}
+        try { if (p2pRegistered) unregisterReceiver(p2pReceiver) } catch (_: Exception) {}
         super.onDestroy()
     }
 }
