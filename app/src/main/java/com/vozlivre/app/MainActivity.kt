@@ -2,582 +2,423 @@ package com.vozlivre.app
 
 import android.Manifest
 import android.app.Activity
+import android.bluetooth.BluetoothAdapter
+import android.content.ClipData
+import android.content.ClipboardManager
 import android.content.Context
-import android.content.BroadcastReceiver
 import android.content.Intent
-import android.content.IntentFilter
 import android.content.pm.PackageManager
-import android.media.AudioFormat
-import android.media.AudioManager
-import android.media.AudioRecord
-import android.media.AudioTrack
-import android.media.MediaRecorder
-import android.net.wifi.WifiManager
-import android.net.wifi.p2p.WifiP2pConfig
-import android.net.wifi.p2p.WifiP2pDevice
-import android.net.wifi.p2p.WifiP2pDeviceList
-import android.net.wifi.p2p.WifiP2pInfo
-import android.net.wifi.p2p.WifiP2pManager
+import android.graphics.Typeface
+import android.graphics.drawable.GradientDrawable
+import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
 import android.view.Gravity
 import android.view.View
+import android.view.WindowManager
 import android.widget.Button
 import android.widget.EditText
+import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
 import android.widget.Toast
-import java.net.DatagramPacket
-import java.net.DatagramSocket
-import java.net.InetAddress
-import java.net.InetSocketAddress
-import java.net.SocketException
-import java.util.concurrent.ConcurrentHashMap
-import kotlin.concurrent.thread
 
-class MainActivity : Activity() {
-    private val controlPort = 39871
-    private val audioPort = 39872
-    private val audioRate = 16000
-    private val packetBytes = 640 // 20 ms, mono PCM16 at 16 kHz
-    private val mainHandler = Handler(Looper.getMainLooper())
-    private val peers = ConcurrentHashMap<String, Peer>()
-    private var displayName = "Utilizador"
-    private var running = false
-    private var inCall = false
-    private var callPeer: Peer? = null
-    private var pendingPeer: Peer? = null
-    private var controlSocket: DatagramSocket? = null
-    private var audioSocket: DatagramSocket? = null
-    private var record: AudioRecord? = null
-    private var track: AudioTrack? = null
-    private var discoveryThread: Thread? = null
-    private var receiveAudioThread: Thread? = null
-    private var sendAudioThread: Thread? = null
-    private var wifiLock: WifiManager.MulticastLock? = null
-    private var p2pManager: WifiP2pManager? = null
-    private var p2pChannel: WifiP2pManager.Channel? = null
-    private var p2pReceiver: BroadcastReceiver? = null
-    private var p2pRegistered = false
-    private var p2pConnected = false
-    private var p2pGroupOwner = false
-    private var p2pOwnerAddress: InetAddress? = null
-    private val p2pDevices = LinkedHashMap<String, WifiP2pDevice>()
+class MainActivity : Activity(), CallEngine.Ui {
 
-    private lateinit var root: LinearLayout
-    private lateinit var status: TextView
-    private lateinit var peerList: LinearLayout
+    private companion object {
+        val BG = 0xFF101713.toInt()
+        val CARD = 0xFF1B2820.toInt()
+        val TEXT = 0xFFFFFFFF.toInt()
+        val MUTED = 0xFFB8C7BD.toInt()
+        val ACCENT = 0xFF17804A.toInt()
+        val ACCENT_LIGHT = 0xFFA4E8BB.toInt()
+        val RED = 0xFFC0392B.toInt()
+        val GREY = 0xFF2F4036.toInt()
+        const val REQ_ENABLE_BT = 21
+    }
+
+    private lateinit var engine: CallEngine
+    private val handler = Handler(Looper.getMainLooper())
+    private var tab = 0
+    private var showLog = false
+
+    private val pending = HashMap<Int, () -> Unit>()
+    private var reqCode = 100
+
     private lateinit var nameInput: EditText
-    private lateinit var callStatus: TextView
+    private lateinit var tabButtons: List<Button>
+    private lateinit var wifiPanel: LinearLayout
+    private lateinit var p2pPanel: LinearLayout
+    private lateinit var btPanel: LinearLayout
+    private lateinit var wifiInfo: TextView
+    private lateinit var ipInput: EditText
     private lateinit var p2pStatus: TextView
+    private lateinit var p2pList: LinearLayout
+    private lateinit var btStatus: TextView
+    private lateinit var peerList: LinearLayout
+    private lateinit var logView: TextView
+    private lateinit var logBox: LinearLayout
+    private lateinit var logToggle: Button
 
-    data class Peer(val name: String, val ip: String, val port: Int = 39871, val seenAt: Long = System.currentTimeMillis())
+    private lateinit var callLayer: LinearLayout
+    private lateinit var callName: TextView
+    private lateinit var callStatus: TextView
+    private lateinit var btnAnswer: Button
+    private lateinit var btnReject: Button
+    private lateinit var btnHang: Button
+    private lateinit var btnMute: Button
+    private lateinit var btnSpeaker: Button
+
+    // ---------------------------------------------------------------- ciclo de vida
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        engine = (application as VozApp).engine
         buildUi()
-        setupWifiDirectReceiver()
-        val needed = mutableListOf<String>()
-        if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) needed.add(Manifest.permission.RECORD_AUDIO)
-        if (checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED) needed.add(Manifest.permission.ACCESS_FINE_LOCATION)
-        if (needed.isNotEmpty()) requestPermissions(needed.toTypedArray(), 10) else startLocalNetwork()
+        engine.start()
+        val base = ArrayList<String>()
+        base.add(Manifest.permission.RECORD_AUDIO)
+        if (Build.VERSION.SDK_INT >= 33) base.add(Manifest.permission.POST_NOTIFICATIONS)
+        withPerms(base) { }
+        if (btPerms().all { checkSelfPermission(it) == PackageManager.PERMISSION_GRANTED }) engine.startBluetooth()
     }
 
-    private fun buildUi() {
-        root = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(28, 30, 28, 24)
-            setBackgroundColor(0xFF101713.toInt())
-        }
-        val title = TextView(this).apply {
-            text = "VozLivre"
-            textSize = 30f
-            setTextColor(0xFFA4E8BB.toInt())
-            gravity = Gravity.CENTER
-        }
-        val subtitle = TextView(this).apply {
-            text = "Chamadas locais • Sem Internet"
-            textSize = 14f
-            setTextColor(0xFFD2E2D7.toInt())
-            gravity = Gravity.CENTER
-            setPadding(0, 6, 0, 20)
-        }
-        nameInput = EditText(this).apply {
-            hint = "O teu nome"
-            setSingleLine(true)
-            setTextColor(0xFFFFFFFF.toInt())
-            setHintTextColor(0xFF9AA79E.toInt())
-            setPadding(18, 10, 18, 10)
-            setBackgroundColor(0xFF26352B.toInt())
-            setText("Utilizador")
-        }
-        val saveName = Button(this).apply {
-            text = "Guardar nome"
-            setOnClickListener {
-                displayName = nameInput.text.toString().trim().ifBlank { "Utilizador" }
-                toast("Nome guardado: $displayName")
-                broadcastHello()
-            }
-        }
-        status = TextView(this).apply {
-            text = "A iniciar rede local..."
-            textSize = 14f
-            setTextColor(0xFFA4E8BB.toInt())
-            setPadding(0, 14, 0, 8)
-        }
-        callStatus = TextView(this).apply {
-            text = "Nenhuma chamada ativa"
-            textSize = 16f
-            setTextColor(0xFFFFFFFF.toInt())
-            setPadding(0, 8, 0, 8)
-        }
-        val p2pButton = Button(this).apply {
-            text = "Procurar telemóveis (Wi-Fi Direct)"
-            setOnClickListener { discoverP2pPeers() }
-        }
-        p2pStatus = TextView(this).apply {
-            text = "Wi-Fi Direct: ainda não ligado"
-            textSize = 14f
-            setTextColor(0xFFD2E2D7.toInt())
-            setPadding(0, 8, 0, 8)
-        }
-        val hangup = Button(this).apply {
-            text = "Terminar chamada"
-            setOnClickListener { endCall("Chamada terminada") }
-        }
-        val section = TextView(this).apply {
-            text = "Telemóveis Wi-Fi Direct / pessoas na rede"
-            textSize = 18f
-            setTextColor(0xFFFFFFFF.toInt())
-            setPadding(0, 18, 0, 8)
-        }
-        peerList = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
-        val scroll = ScrollView(this).apply { addView(peerList) }
-        root.addView(title)
-        root.addView(subtitle)
-        root.addView(nameInput)
-        root.addView(saveName)
-        root.addView(status)
-        root.addView(callStatus)
-        root.addView(p2pButton)
-        root.addView(p2pStatus)
-        root.addView(hangup)
-        root.addView(section)
-        root.addView(scroll, LinearLayout.LayoutParams(-1, 0, 1f))
-        setContentView(root)
+    override fun onStart() {
+        super.onStart()
+        engine.ui = this
+        refreshAll()
+    }
+
+    override fun onStop() {
+        if (engine.ui === this) engine.ui = null
+        handler.removeCallbacks(ticker)
+        super.onStop()
+    }
+
+    override fun onDestroy() {
+        if (isFinishing && engine.state == CallEngine.State.IDLE) engine.stopAll()
+        super.onDestroy()
+    }
+
+    // ---------------------------------------------------------------- permissões
+
+    private fun p2pPerms(): List<String> =
+        if (Build.VERSION.SDK_INT >= 33) listOf(Manifest.permission.NEARBY_WIFI_DEVICES)
+        else listOf(Manifest.permission.ACCESS_FINE_LOCATION)
+
+    private fun btPerms(): List<String> =
+        if (Build.VERSION.SDK_INT >= 31) listOf(Manifest.permission.BLUETOOTH_CONNECT, Manifest.permission.BLUETOOTH_SCAN)
+        else listOf(Manifest.permission.ACCESS_FINE_LOCATION)
+
+    private fun withPerms(perms: List<String>, whenOk: () -> Unit) {
+        val missing = perms.filter { checkSelfPermission(it) != PackageManager.PERMISSION_GRANTED }
+        if (missing.isEmpty()) { whenOk(); return }
+        val code = reqCode++
+        pending[code] = whenOk
+        requestPermissions(missing.toTypedArray(), code)
     }
 
     override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
-        if (requestCode == 11) {
-            if (checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED) discoverP2pPeers()
-            else p2pStatus.text = "A permissão é necessária para procurar dispositivos Wi-Fi Direct."
-            return
-        }
-        if (requestCode == 10) {
-            val audioGranted = checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
-            if (audioGranted) startLocalNetwork()
-            else status.text = "É necessário permitir o microfone para chamadas."
-            if (checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED) {
-                p2pStatus.text = "Permite a localização para procurar dispositivos Wi-Fi Direct (o Android exige esta permissão)."
-            }
+        val action = pending.remove(requestCode) ?: return
+        if (grantResults.isNotEmpty() && grantResults.all { it == PackageManager.PERMISSION_GRANTED }) action()
+        else toast("Permissão necessária não concedida")
+    }
+
+    @Deprecated("Deprecated in Java")
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        super.onActivityResult(requestCode, resultCode, data)
+        if (requestCode == REQ_ENABLE_BT && resultCode == RESULT_OK) {
+            engine.startBluetooth()
+            engine.bt.startScan()
         }
     }
 
-    private fun setupWifiDirectReceiver() {
-        p2pManager = getSystemService(Context.WIFI_P2P_SERVICE) as? WifiP2pManager
-        p2pChannel = p2pManager?.initialize(this, mainLooper, null)
-        val filter = IntentFilter().apply {
-            addAction(WifiP2pManager.WIFI_P2P_STATE_CHANGED_ACTION)
-            addAction(WifiP2pManager.WIFI_P2P_PEERS_CHANGED_ACTION)
-            addAction(WifiP2pManager.WIFI_P2P_CONNECTION_CHANGED_ACTION)
-            addAction(WifiP2pManager.WIFI_P2P_THIS_DEVICE_CHANGED_ACTION)
+    // ---------------------------------------------------------------- construção da interface
+
+    private fun dp(v: Int) = (v * resources.displayMetrics.density + 0.5f).toInt()
+
+    private fun tv(text: String, size: Float = 14f, color: Int = TEXT): TextView =
+        TextView(this).apply { this.text = text; textSize = size; setTextColor(color) }
+
+    private fun box(color: Int, radius: Int = 12): GradientDrawable =
+        GradientDrawable().apply { setColor(color); cornerRadius = dp(radius).toFloat() }
+
+    private fun btn(text: String, color: Int = ACCENT, onClick: () -> Unit): Button =
+        Button(this).apply {
+            this.text = text
+            isAllCaps = false
+            setTextColor(TEXT)
+            background = box(color)
+            setPadding(dp(14), dp(8), dp(14), dp(8))
+            setOnClickListener { onClick() }
         }
-        p2pReceiver = object : BroadcastReceiver() {
-            override fun onReceive(context: Context, intent: Intent) {
-                when (intent.action) {
-                    WifiP2pManager.WIFI_P2P_STATE_CHANGED_ACTION -> {
-                        val enabled = intent.getIntExtra(WifiP2pManager.EXTRA_WIFI_STATE, -1) == WifiP2pManager.WIFI_P2P_STATE_ENABLED
-                        mainHandler.post { p2pStatus.text = if (enabled) "Wi-Fi Direct disponível. Toca em Procurar." else "Ativa o Wi-Fi nas definições do telemóvel." }
-                    }
-                    WifiP2pManager.WIFI_P2P_PEERS_CHANGED_ACTION -> requestP2pPeers()
-                    WifiP2pManager.WIFI_P2P_CONNECTION_CHANGED_ACTION -> {
-                        val manager = p2pManager ?: return
-                        val channel = p2pChannel ?: return
-                        manager.requestConnectionInfo(channel) { info -> handleP2pConnection(info) }
-                    }
+
+    private fun lp(w: Int = -1, h: Int = -2, top: Int = 0, bottom: Int = 0, weight: Float = 0f) =
+        LinearLayout.LayoutParams(w, h, weight).apply { topMargin = dp(top); bottomMargin = dp(bottom) }
+
+    private fun buildUi() {
+        val root = FrameLayout(this).apply { setBackgroundColor(BG) }
+        val col = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(16), dp(24), dp(16), dp(24))
+        }
+
+        col.addView(tv("VozLivre", 30f, ACCENT_LIGHT).apply { gravity = Gravity.CENTER })
+        col.addView(tv("Chamadas de voz sem Internet", 14f, MUTED).apply { gravity = Gravity.CENTER }, lp(bottom = 14))
+
+        nameInput = EditText(this).apply {
+            hint = "O teu nome"
+            setSingleLine(true)
+            setTextColor(TEXT); setHintTextColor(MUTED)
+            background = box(CARD)
+            setPadding(dp(14), dp(10), dp(14), dp(10))
+            setText(engine.displayName)
+        }
+        val nameRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        nameRow.addView(nameInput, lp(0, -2, weight = 1f))
+        nameRow.addView(btn("Guardar") {
+            engine.setName(nameInput.text.toString())
+            toast("Nome guardado: ${engine.displayName}")
+        }, lp(-2, -2).apply { leftMargin = dp(8) })
+        col.addView(nameRow, lp(bottom = 12))
+
+        val tabs = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        val names = listOf("Wi-Fi", "Wi-Fi Direct", "Bluetooth")
+        tabButtons = names.mapIndexed { i, n -> btn(n, GREY) { tab = i; refreshAll() } }
+        tabButtons.forEachIndexed { i, b -> tabs.addView(b, lp(0, -2, weight = 1f).apply { if (i > 0) leftMargin = dp(6) }) }
+        col.addView(tabs, lp(bottom = 10))
+
+        // Painel Wi-Fi
+        wifiPanel = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        wifiInfo = tv("", 13f, MUTED)
+        wifiPanel.addView(wifiInfo, lp(bottom = 8))
+        wifiPanel.addView(tv("Se os telemóveis não se encontrarem sozinhos, escreve o IP do outro (aparece no ecrã dele).", 13f, MUTED), lp(bottom = 6))
+        ipInput = EditText(this).apply {
+            hint = "ex.: 192.168.1.23"
+            setSingleLine(true)
+            setTextColor(TEXT); setHintTextColor(MUTED)
+            background = box(CARD)
+            setPadding(dp(14), dp(10), dp(14), dp(10))
+        }
+        val ipRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        ipRow.addView(ipInput, lp(0, -2, weight = 1f))
+        ipRow.addView(btn("Procurar") {
+            val ip = ipInput.text.toString().trim()
+            if (ip.isNotEmpty()) engine.lan.probe(ip)
+        }, lp(-2, -2).apply { leftMargin = dp(8) })
+        wifiPanel.addView(ipRow)
+        col.addView(wifiPanel, lp(bottom = 8))
+
+        // Painel Wi-Fi Direct
+        p2pPanel = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        val p2pRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        p2pRow.addView(btn("Procurar telemóveis") {
+            withPerms(p2pPerms()) { engine.p2p.discover() }
+        }, lp(0, -2, weight = 1f))
+        p2pRow.addView(btn("Terminar grupo", GREY) { engine.p2p.disconnect() }, lp(0, -2, weight = 1f).apply { leftMargin = dp(8) })
+        p2pPanel.addView(p2pRow, lp(bottom = 6))
+        p2pStatus = tv("", 13f, MUTED)
+        p2pPanel.addView(p2pStatus, lp(bottom = 6))
+        p2pPanel.addView(tv("Faz Procurar nos dois telemóveis, toca em Ligar num deles e aceita o convite no outro. Precisa do Wi-Fi ligado (e da localização ligada até ao Android 12).", 12f, MUTED), lp(bottom = 6))
+        p2pList = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        p2pPanel.addView(p2pList)
+        col.addView(p2pPanel, lp(bottom = 8))
+
+        // Painel Bluetooth
+        btPanel = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        val btRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        btRow.addView(btn("Procurar") { startBluetoothScan() }, lp(0, -2, weight = 1f))
+        btRow.addView(btn("Tornar visível", GREY) {
+            withPerms(btPerms()) {
+                startActivity(Intent(BluetoothAdapter.ACTION_REQUEST_DISCOVERABLE).putExtra(BluetoothAdapter.EXTRA_DISCOVERABLE_DURATION, 120))
+            }
+        }, lp(0, -2, weight = 1f).apply { leftMargin = dp(8) })
+        btPanel.addView(btRow, lp(bottom = 6))
+        btStatus = tv("", 13f, MUTED)
+        btPanel.addView(btStatus, lp(bottom = 6))
+        btPanel.addView(tv("Os dois telemóveis precisam de ter o VozLivre aberto. A qualidade é menor (8 kHz) e o alcance é de poucos metros.", 12f, MUTED))
+        col.addView(btPanel, lp(bottom = 8))
+
+        col.addView(tv("Pessoas encontradas", 18f), lp(top = 6, bottom = 6))
+        peerList = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        col.addView(peerList)
+
+        // Diagnóstico
+        logToggle = btn("Mostrar diagnóstico", GREY) { showLog = !showLog; refreshAll() }
+        col.addView(logToggle, lp(top = 16))
+        logBox = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        logBox.addView(btn("Copiar registo", GREY) {
+            val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+            cm.setPrimaryClip(ClipData.newPlainText("VozLivre", engine.logText()))
+            toast("Registo copiado")
+        }, lp(top = 8, bottom = 6))
+        logView = tv("", 10f, MUTED).apply { typeface = Typeface.MONOSPACE; setTextIsSelectable(true) }
+        logBox.addView(logView)
+        col.addView(logBox)
+
+        root.addView(ScrollView(this).apply { addView(col) })
+
+        // Camada de chamada
+        callLayer = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER_HORIZONTAL
+            setBackgroundColor(BG)
+            setPadding(dp(24), dp(80), dp(24), dp(48))
+            visibility = View.GONE
+            isClickable = true
+        }
+        callName = tv("", 30f).apply { gravity = Gravity.CENTER }
+        callStatus = tv("", 18f, ACCENT_LIGHT).apply { gravity = Gravity.CENTER }
+        callLayer.addView(callName, lp(top = 40))
+        callLayer.addView(callStatus, lp(top = 12))
+        callLayer.addView(View(this), lp(-1, 0, weight = 1f))
+        btnMute = btn("Silenciar", GREY) { engine.toggleMute() }
+        btnSpeaker = btn("Altifalante", GREY) { engine.toggleSpeaker() }
+        val tools = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        tools.addView(btnMute, lp(0, -2, weight = 1f))
+        tools.addView(btnSpeaker, lp(0, -2, weight = 1f).apply { leftMargin = dp(10) })
+        callLayer.addView(tools, lp(bottom = 16))
+        btnAnswer = btn("Atender", ACCENT) { engine.answer() }
+        btnReject = btn("Recusar", RED) { engine.reject() }
+        btnHang = btn("Terminar chamada", RED) { engine.hangup() }
+        callLayer.addView(btnAnswer, lp(bottom = 10))
+        callLayer.addView(btnReject, lp(bottom = 10))
+        callLayer.addView(btnHang)
+        root.addView(callLayer, FrameLayout.LayoutParams(-1, -1))
+
+        setContentView(root)
+    }
+
+    // ---------------------------------------------------------------- atualização
+
+    private fun refreshAll() {
+        tabButtons.forEachIndexed { i, b -> b.background = box(if (i == tab) ACCENT else GREY) }
+        wifiPanel.visibility = if (tab == 0) View.VISIBLE else View.GONE
+        p2pPanel.visibility = if (tab == 1) View.VISIBLE else View.GONE
+        btPanel.visibility = if (tab == 2) View.VISIBLE else View.GONE
+        logBox.visibility = if (showLog) View.VISIBLE else View.GONE
+        logToggle.text = if (showLog) "Esconder diagnóstico" else "Mostrar diagnóstico"
+        onPeersChanged()
+        onLog()
+        onStateChanged()
+    }
+
+    override fun onPeersChanged() {
+        wifiInfo.text = "O teu IP:\n" + engine.lan.describeLinks()
+        p2pStatus.text = engine.p2p.status
+        btStatus.text = when {
+            !engine.bt.available -> "Este telemóvel não tem Bluetooth"
+            !engine.bt.isEnabled() -> "Bluetooth desligado. Toca em Procurar para ligar."
+            else -> "Bluetooth ligado"
+        }
+
+        p2pList.removeAllViews()
+        if (tab == 1) {
+            for (d in engine.p2p.devices) {
+                val row = LinearLayout(this).apply {
+                    orientation = LinearLayout.HORIZONTAL
+                    gravity = Gravity.CENTER_VERTICAL
+                    background = box(CARD)
+                    setPadding(dp(12), dp(8), dp(12), dp(8))
                 }
+                row.addView(tv("${d.deviceName.ifBlank { "Sem nome" }}\n${p2pState(d.status)}", 15f), lp(0, -2, weight = 1f))
+                row.addView(btn("Ligar") { engine.p2p.connect(d) }, lp(-2, -2))
+                p2pList.addView(row, lp(bottom = 8))
             }
         }
-        try {
-            registerReceiver(p2pReceiver, filter)
-            p2pRegistered = true
-        } catch (_: Exception) { }
-    }
 
-    private fun discoverP2pPeers() {
-        if (checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED) {
-            requestPermissions(arrayOf(Manifest.permission.ACCESS_FINE_LOCATION), 11)
-            return
-        }
-        val manager = p2pManager
-        val channel = p2pChannel
-        if (manager == null || channel == null) {
-            p2pStatus.text = "Este telemóvel não disponibiliza Wi-Fi Direct."
-            return
-        }
-        p2pStatus.text = "A procurar telemóveis próximos... mantém o Wi-Fi ligado nos dois."
-        manager.discoverPeers(channel, object : WifiP2pManager.ActionListener {
-            override fun onSuccess() { mainHandler.post { p2pStatus.text = "Procura iniciada. Escolhe um telemóvel na lista abaixo." } }
-            override fun onFailure(reason: Int) { mainHandler.post { p2pStatus.text = "Falha na procura Wi-Fi Direct (código $reason). Confirma que o Wi-Fi está ligado." } }
-        })
-    }
-
-    private fun requestP2pPeers() {
-        val manager = p2pManager ?: return
-        val channel = p2pChannel ?: return
-        manager.requestPeers(channel) { list: WifiP2pDeviceList ->
-            p2pDevices.clear()
-            list.deviceList.forEach { device -> p2pDevices[device.deviceAddress] = device }
-            mainHandler.post { refreshPeers() }
-        }
-    }
-
-    private fun connectP2pDevice(device: WifiP2pDevice) {
-        val manager = p2pManager ?: return
-        val channel = p2pChannel ?: return
-        val config = WifiP2pConfig().apply { deviceAddress = device.deviceAddress }
-        p2pStatus.text = "A ligar a ${device.deviceName ?: "telemóvel"}... aceita o pedido no outro dispositivo se aparecer."
-        manager.connect(channel, config, object : WifiP2pManager.ActionListener {
-            override fun onSuccess() { mainHandler.post { p2pStatus.text = "Pedido de ligação enviado para ${device.deviceName}." } }
-            override fun onFailure(reason: Int) { mainHandler.post { p2pStatus.text = "Não foi possível ligar (código $reason). Tenta procurar novamente." } }
-        })
-    }
-
-    private fun handleP2pConnection(info: WifiP2pInfo) {
-        p2pConnected = info.groupFormed
-        p2pGroupOwner = info.isGroupOwner
-        p2pOwnerAddress = info.groupOwnerAddress
-        if (info.groupFormed) {
-            mainHandler.post {
-                p2pStatus.text = if (info.isGroupOwner) "Wi-Fi Direct ligado. Este telemóvel criou o grupo." else "Wi-Fi Direct ligado ao outro telemóvel."
-                status.text = "Ligação direta ativa; a procurar o outro utilizador..."
-            }
-            // Give Android a moment to configure the P2P network interface, then announce presence.
-            thread {
-                Thread.sleep(1200)
-                repeat(3) { broadcastHello(); Thread.sleep(500) }
-            }
-        } else {
-            mainHandler.post { p2pStatus.text = "Wi-Fi Direct: desligado" }
-        }
-    }
-
-    private fun startLocalNetwork() {
-        if (running) return
-        running = true
-        displayName = nameInput.text.toString().trim().ifBlank { "Utilizador" }
-        try {
-            val wm = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
-            wifiLock = wm.createMulticastLock("vozlivre-multicast").apply { setReferenceCounted(true); acquire() }
-        } catch (_: Exception) {}
-        discoveryThread = thread(name = "vozlivre-control") {
-            try {
-                controlSocket = DatagramSocket(null).apply {
-                    reuseAddress = true
-                    bind(InetSocketAddress(controlPort))
-                    broadcast = true
-                    soTimeout = 1000
-                }
-                audioSocket = DatagramSocket(null).apply {
-                    reuseAddress = true
-                    bind(InetSocketAddress(audioPort))
-                    soTimeout = 1000
-                }
-                mainHandler.post { status.text = "Rede local ativa. A procurar utilizadores..." }
-                thread { receiveControlLoop() }
-                thread { receiveAudioLoop() }
-                while (running) {
-                    broadcastHello()
-                    val now = System.currentTimeMillis()
-                    peers.entries.removeIf { now - it.value.seenAt > 12000 }
-                    mainHandler.post { refreshPeers() }
-                    Thread.sleep(3000)
-                }
-            } catch (e: Exception) {
-                mainHandler.post { status.text = "Erro de rede: ${e.message ?: "não foi possível iniciar"}" }
-            }
-        }
-    }
-
-    private fun broadcastHello() {
-        try {
-            val socket = controlSocket ?: return
-            val msg = "HELLO|${safeName(displayName)}|$audioPort"
-            val data = msg.toByteArray(Charsets.UTF_8)
-            val address = InetAddress.getByName("255.255.255.255")
-            socket.send(DatagramPacket(data, data.size, address, controlPort))
-            if (p2pConnected) {
-                try {
-                    socket.send(DatagramPacket(data, data.size, InetAddress.getByName("192.168.49.255"), controlPort))
-                    if (!p2pGroupOwner) p2pOwnerAddress?.let { socket.send(DatagramPacket(data, data.size, it, controlPort)) }
-                } catch (_: Exception) { }
-            }
-        } catch (_: Exception) {}
-    }
-
-    private fun receiveControlLoop() {
-        val buffer = ByteArray(2048)
-        while (running) {
-            try {
-                val packet = DatagramPacket(buffer, buffer.size)
-                controlSocket?.receive(packet) ?: continue
-                val msg = String(packet.data, packet.offset, packet.length, Charsets.UTF_8)
-                val ip = packet.address.hostAddress ?: continue
-                val parts = msg.split("|")
-                if (parts.size < 2) continue
-                when (parts[0]) {
-                    "HELLO" -> {
-                        val name = parts[1].replace("_", " ")
-                        if (ip != localIp()) {
-                            peers[ip] = Peer(name, ip, if (parts.size > 2) parts[2].toIntOrNull() ?: audioPort else audioPort)
-                            mainHandler.post { refreshPeers() }
-                        }
-                    }
-                    "CALL" -> {
-                        if (!inCall) {
-                            val p = Peer(parts.getOrElse(1) { "Utilizador" }.replace("_", " "), ip)
-                            pendingPeer = p
-                            mainHandler.post { showIncomingCall(p) }
-                        } else sendControl(ip, "BUSY|${safeName(displayName)}")
-                    }
-                    "ACCEPT" -> {
-                        if (callPeer?.ip == ip) {
-                            mainHandler.post { callStatus.text = "Em chamada com ${callPeer?.name}" }
-                            startAudio(ip)
-                        }
-                    }
-                    "REJECT" -> mainHandler.post { toast("${parts.getOrElse(1) { "A pessoa" }} rejeitou a chamada") }
-                    "HANGUP" -> {
-                        if (callPeer?.ip == ip) endCall("A outra pessoa terminou a chamada", false)
-                        pendingPeer = null
-                    }
-                    "BUSY" -> mainHandler.post { toast("O utilizador está ocupado") }
-                }
-            } catch (_: SocketException) {
-                if (!running) break
-            } catch (_: Exception) {}
-        }
-    }
-
-    private fun showIncomingCall(peer: Peer) {
-        android.app.AlertDialog.Builder(this)
-            .setTitle("Chamada recebida")
-            .setMessage("${peer.name} está a ligar-te.")
-            .setPositiveButton("Atender") { _, _ ->
-                if (inCall) return@setPositiveButton
-                callPeer = peer
-                inCall = true
-                sendControl(peer.ip, "ACCEPT|${safeName(displayName)}")
-                callStatus.text = "Em chamada com ${peer.name}"
-                startAudio(peer.ip)
-            }
-            .setNegativeButton("Rejeitar") { _, _ ->
-                sendControl(peer.ip, "REJECT|${safeName(displayName)}")
-                pendingPeer = null
-            }
-            .setOnCancelListener { pendingPeer = null }
-            .show()
-    }
-
-    private fun refreshPeers() {
         peerList.removeAllViews()
-        p2pDevices.values.forEach { device ->
+        val shown = engine.allPeers().filter {
+            when (tab) {
+                0 -> it.kind == PeerKind.LAN && !it.isP2p
+                1 -> it.kind == PeerKind.LAN && it.isP2p
+                else -> it.kind == PeerKind.BLUETOOTH
+            }
+        }
+        if (shown.isEmpty()) {
+            peerList.addView(tv("Ninguém encontrado ainda. Abre o VozLivre no outro telemóvel.", 14f, MUTED))
+        }
+        val busy = engine.state != CallEngine.State.IDLE
+        for (p in shown) {
             val row = LinearLayout(this).apply {
-                orientation = LinearLayout.VERTICAL
-                setPadding(14, 12, 14, 12)
-                setBackgroundColor(0xFF263A48.toInt())
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+                background = box(CARD)
+                setPadding(dp(12), dp(8), dp(12), dp(8))
             }
-            val label = TextView(this).apply {
-                text = "${device.deviceName ?: "Telemóvel sem nome"}\nWi-Fi Direct • ${p2pStatusText(device.status)}"
-                textSize = 16f
-                setTextColor(0xFFFFFFFF.toInt())
-            }
-            val connect = Button(this).apply {
-                text = if (device.status == WifiP2pDevice.CONNECTED) "Ligado" else "Ligar por Wi-Fi Direct"
-                isEnabled = device.status != WifiP2pDevice.CONNECTED && !inCall
-                setOnClickListener { connectP2pDevice(device) }
-            }
-            row.addView(label); row.addView(connect)
-            val lp = LinearLayout.LayoutParams(-1, -2); lp.bottomMargin = 12
-            peerList.addView(row, lp)
-        }
-        if (peers.isEmpty() && p2pDevices.isEmpty()) {
-            peerList.addView(TextView(this).apply {
-                text = "Ainda não foram encontrados utilizadores. Para Wi-Fi Direct, toca em Procurar nos dois telemóveis. Para a rede antiga, ambos devem estar na mesma rede Wi-Fi."
-                setTextColor(0xFFB8C7BD.toInt())
-                textSize = 14f
-                setPadding(0, 10, 0, 10)
-            })
-            return
-        }
-        peers.values.sortedBy { it.name }.forEach { peer ->
-            val row = LinearLayout(this).apply {
-                orientation = LinearLayout.VERTICAL
-                setPadding(14, 12, 14, 12)
-                setBackgroundColor(0xFF213127.toInt())
-            }
-            val label = TextView(this).apply {
-                text = "${peer.name}\n${peer.ip}"
-                textSize = 16f
-                setTextColor(0xFFFFFFFF.toInt())
-            }
-            val call = Button(this).apply {
-                text = "Ligar"
-                isEnabled = !inCall
-                setOnClickListener { callPeer(peer) }
-            }
-            row.addView(label)
-            row.addView(call)
-            val lp = LinearLayout.LayoutParams(-1, -2)
-            lp.bottomMargin = 12
-            peerList.addView(row, lp)
+            row.addView(tv("${p.name}\n${p.detail}", 16f), lp(0, -2, weight = 1f))
+            row.addView(btn("Ligar") {
+                withPerms(listOf(Manifest.permission.RECORD_AUDIO)) { engine.startCall(p) }
+            }.apply { isEnabled = !busy; alpha = if (busy) 0.4f else 1f }, lp(-2, -2))
+            peerList.addView(row, lp(bottom = 8))
         }
     }
 
-    private fun p2pStatusText(value: Int): String = when (value) {
-        WifiP2pDevice.AVAILABLE -> "disponível"
-        WifiP2pDevice.INVITED -> "convite enviado"
-        WifiP2pDevice.CONNECTED -> "conectado"
-        WifiP2pDevice.FAILED -> "falhou"
-        WifiP2pDevice.UNAVAILABLE -> "indisponível"
-        else -> "estado desconhecido"
+    override fun onLog() {
+        if (showLog) logView.text = engine.logText()
     }
 
-    private fun callPeer(peer: Peer) {
-        if (inCall) { toast("Já estás numa chamada"); return }
-        callPeer = peer
-        inCall = true
-        callStatus.text = "A chamar ${peer.name}..."
-        refreshPeers()
-        sendControl(peer.ip, "CALL|${safeName(displayName)}")
-        mainHandler.postDelayed({
-            if (inCall && callStatus.text.toString().startsWith("A chamar")) {
-                endCall("Sem resposta", false)
-            }
-        }, 30000)
+    override fun onToast(msg: String) { toast(msg) }
+
+    override fun onStateChanged() {
+        val st = engine.state
+        callLayer.visibility = if (st == CallEngine.State.IDLE) View.GONE else View.VISIBLE
+        val p = engine.peer
+        callName.text = p?.name ?: ""
+        btnAnswer.visibility = if (st == CallEngine.State.INCOMING) View.VISIBLE else View.GONE
+        btnReject.visibility = if (st == CallEngine.State.INCOMING) View.VISIBLE else View.GONE
+        btnHang.visibility = if (st == CallEngine.State.OUTGOING || st == CallEngine.State.ACTIVE) View.VISIBLE else View.GONE
+        val tools = if (st == CallEngine.State.ACTIVE) View.VISIBLE else View.GONE
+        btnMute.visibility = tools; btnSpeaker.visibility = tools
+        btnMute.text = if (engine.muted) "Ativar microfone" else "Silenciar"
+        btnMute.background = box(if (engine.muted) RED else GREY)
+        btnSpeaker.background = box(if (engine.speaker) ACCENT else GREY)
+        updateCallText()
+        handler.removeCallbacks(ticker)
+        if (st == CallEngine.State.ACTIVE) handler.postDelayed(ticker, 1000)
+        onPeersChanged()
     }
 
-    private fun sendControl(ip: String, message: String) {
-        thread {
-            try {
-                val bytes = message.toByteArray(Charsets.UTF_8)
-                DatagramSocket().use { it.send(DatagramPacket(bytes, bytes.size, InetAddress.getByName(ip), controlPort)) }
-            } catch (_: Exception) {}
+    private val ticker = object : Runnable {
+        override fun run() {
+            updateCallText()
+            if (engine.state == CallEngine.State.ACTIVE) handler.postDelayed(this, 1000)
         }
     }
 
-    private fun startAudio(remoteIp: String) {
-        stopAudioOnly()
-        try {
-            val minIn = AudioRecord.getMinBufferSize(audioRate, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT)
-            val minOut = AudioTrack.getMinBufferSize(audioRate, AudioFormat.CHANNEL_OUT_MONO, AudioFormat.ENCODING_PCM_16BIT)
-            record = AudioRecord(MediaRecorder.AudioSource.VOICE_COMMUNICATION, audioRate,
-                AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT, maxOf(minIn, packetBytes * 4))
-            track = AudioTrack(AudioManager.STREAM_VOICE_CALL, audioRate,
-                AudioFormat.CHANNEL_OUT_MONO, AudioFormat.ENCODING_PCM_16BIT, maxOf(minOut, packetBytes * 4),
-                AudioTrack.MODE_STREAM)
-            val r = record!!
-            val t = track!!
-            if (r.state != AudioRecord.STATE_INITIALIZED || t.state != AudioTrack.STATE_INITIALIZED) {
-                endCall("Não foi possível iniciar o áudio", false); return
+    private fun updateCallText() {
+        if (engine.state == CallEngine.State.ACTIVE) {
+            val s = (SystemClock.elapsedRealtime() - engine.activeSince) / 1000
+            callStatus.text = "Em chamada  %02d:%02d".format(s / 60, s % 60)
+        } else callStatus.text = engine.statusText
+    }
+
+    // ---------------------------------------------------------------- Bluetooth
+
+    private fun startBluetoothScan() {
+        withPerms(btPerms()) {
+            if (!engine.bt.available) { toast("Sem Bluetooth neste telemóvel"); return@withPerms }
+            if (!engine.bt.isEnabled()) {
+                startActivityForResult(Intent(BluetoothAdapter.ACTION_REQUEST_ENABLE), REQ_ENABLE_BT)
+            } else {
+                engine.startBluetooth()
+                engine.bt.startScan()
             }
-            val am = getSystemService(Context.AUDIO_SERVICE) as AudioManager
-            am.mode = AudioManager.MODE_IN_COMMUNICATION
-            am.isSpeakerphoneOn = true
-            r.startRecording()
-            t.play()
-            sendAudioThread = thread(name = "voz-send") {
-                val buf = ByteArray(packetBytes)
-                while (running && inCall && callPeer?.ip == remoteIp) {
-                    try {
-                        val n = r.read(buf, 0, buf.size)
-                        if (n > 0) {
-                            val packet = DatagramPacket(buf, n, InetAddress.getByName(remoteIp), audioPort)
-                            audioSocket?.send(packet)
-                        }
-                    } catch (_: Exception) { break }
-                }
-            }
-            mainHandler.post { callStatus.text = "Em chamada com ${callPeer?.name}" }
-        } catch (e: Exception) {
-            mainHandler.post { endCall("Erro de áudio: ${e.message}", false) }
         }
     }
 
-    private fun receiveAudioLoop() {
-        val buf = ByteArray(2048)
-        while (running) {
-            try {
-                val packet = DatagramPacket(buf, buf.size)
-                audioSocket?.receive(packet) ?: continue
-                val peer = callPeer
-                if (!inCall || peer == null || packet.address.hostAddress != peer.ip) continue
-                val copy = packet.data.copyOfRange(packet.offset, packet.offset + packet.length)
-                val t = track
-                if (t != null && t.playState == AudioTrack.PLAYSTATE_PLAYING) t.write(copy, 0, copy.size)
-            } catch (_: SocketException) {
-                if (!running) break
-            } catch (_: Exception) {}
-        }
+    private fun p2pState(v: Int) = when (v) {
+        android.net.wifi.p2p.WifiP2pDevice.AVAILABLE -> "disponível"
+        android.net.wifi.p2p.WifiP2pDevice.INVITED -> "convite enviado"
+        android.net.wifi.p2p.WifiP2pDevice.CONNECTED -> "ligado"
+        android.net.wifi.p2p.WifiP2pDevice.FAILED -> "falhou"
+        else -> "indisponível"
     }
 
-    private fun stopAudioOnly() {
-        try { record?.stop() } catch (_: Exception) {}
-        try { record?.release() } catch (_: Exception) {}
-        record = null
-        try { track?.stop() } catch (_: Exception) {}
-        try { track?.release() } catch (_: Exception) {}
-        track = null
-    }
-
-    private fun endCall(message: String, notifyPeer: Boolean = true) {
-        val old = callPeer
-        if (notifyPeer && old != null) sendControl(old.ip, "HANGUP|${safeName(displayName)}")
-        inCall = false
-        callPeer = null
-        pendingPeer = null
-        stopAudioOnly()
-        try {
-            val am = getSystemService(Context.AUDIO_SERVICE) as AudioManager
-            am.mode = AudioManager.MODE_NORMAL
-            am.isSpeakerphoneOn = false
-        } catch (_: Exception) {}
-        callStatus.text = message
-        refreshPeers()
-    }
-
-    private fun localIp(): String? {
-        return try {
-            val wm = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
-            val raw = wm.connectionInfo.ipAddress
-            if (raw == 0) null else "${raw and 0xff}.${raw shr 8 and 0xff}.${raw shr 16 and 0xff}.${raw shr 24 and 0xff}"
-        } catch (_: Exception) { null }
-    }
-
-    private fun safeName(value: String) = value.trim().replace("|", " ").replace("\n", " ").replace(" ", "_").take(32)
-
-    private fun toast(message: String) = Toast.makeText(this, message, Toast.LENGTH_SHORT).show()
-
-    override fun onDestroy() {
-        running = false
-        endCall("Aplicação fechada")
-        try { controlSocket?.close() } catch (_: Exception) {}
-        try { audioSocket?.close() } catch (_: Exception) {}
-        try { wifiLock?.release() } catch (_: Exception) {}
-        try { if (p2pRegistered) unregisterReceiver(p2pReceiver) } catch (_: Exception) {}
-        super.onDestroy()
-    }
+    private fun toast(m: String) = Toast.makeText(this, m, Toast.LENGTH_SHORT).show()
 }

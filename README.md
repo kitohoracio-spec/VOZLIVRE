@@ -1,23 +1,32 @@
-# VozLivre — protótipo Android com Wi-Fi Direct
+# VozLivre 0.2
 
-Esta versão experimental mantém o modo de rede Wi-Fi existente e acrescenta uma primeira integração com Wi-Fi Direct para procurar e ligar dois telemóveis Android sem router nem Internet.
+Chamadas de voz entre telemóveis Android sem Internet, por três caminhos: rede Wi-Fi (router ou hotspot), Wi-Fi Direct e Bluetooth.
 
 ## Como testar
-1. Instala o APK nos dois telemóveis Android.
-2. Ativa o Wi-Fi nos dois aparelhos (não é necessário ligar a um router).
-3. Abre VozLivre e permite o microfone e a localização quando o Android pedir. A permissão de localização é exigida por versões antigas do Android para descobrir dispositivos Wi-Fi Direct.
-4. Nos dois telemóveis, toca em **Procurar telemóveis (Wi-Fi Direct)**.
-5. Quando aparecer o outro telemóvel, toca em **Ligar por Wi-Fi Direct** num dos aparelhos e aceita os pedidos de ligação que o Android apresentar.
-6. Depois de a ligação direta estar estabelecida, espera que os nomes apareçam na lista e toca em **Ligar** para iniciar a chamada.
 
-## Limitações importantes
-- Esta é uma versão experimental; a descoberta P2P e o áudio precisam de ser validados em dois dispositivos físicos. Fabricantes e versões de Android podem apresentar comportamentos diferentes.
-- Wi-Fi Direct não garante um alcance específico. Mais de 500 metros não é uma expectativa realista entre telemóveis comuns; será necessário equipamento de rádio Wi-Fi de longo alcance e linha de vista para essa fase.
-- O áudio e os comandos desta versão não são encriptados. Usa apenas para testes, não para conversas privadas.
-- A app deve permanecer aberta durante os testes. Não inclui suporte completo para chamadas em segundo plano.
-- O áudio usa PCM16 mono a 16 kHz via UDP. A qualidade depende dos aparelhos e da ligação.
+1. Instala o APK nos dois telemóveis e abre a app nos dois. Aceita microfone e notificações.
+2. Escolhe o separador e faz o mesmo nos dois aparelhos.
+   - **Wi-Fi**: os dois ligados à mesma rede, ou um com hotspot ligado e o outro ligado a ele. A app mostra o IP de cada um; se não se encontrarem, escreve o IP do outro e toca em Procurar.
+   - **Wi-Fi Direct**: toca em Procurar nos dois, depois em Ligar num deles e aceita o convite no outro. Quando o grupo se forma, o outro aparece em "Pessoas encontradas".
+   - **Bluetooth**: toca em Procurar (e em Tornar visível no outro). Funciona com aparelhos emparelhados ou não.
+3. Toca em Ligar ao lado do nome. O outro telemóvel toca; ao atender, a chamada fica ativa com temporizador, silenciar e altifalante.
 
-## Compilar APK com GitHub Actions
-1. Carrega o conteúdo desta pasta para o repositório GitHub, mantendo a estrutura dos ficheiros.
-2. Abre **Actions** e executa **Build VozLivre APK** ou faz push para `main`.
-3. Descarrega o artefacto `VozLivre-debug-apk` da execução concluída e extrai `app-debug.apk`.
+## Se a chamada não acontecer
+
+Abre **Mostrar diagnóstico** no ecrã principal, toca em **Copiar registo** e envia o texto. O registo mostra as interfaces de rede, os sockets abertos, os pares encontrados e cada mensagem de chamada.
+
+Causas frequentes:
+- Router com "isolamento de clientes" ou "AP isolation": bloqueia tudo entre telemóveis. Usa hotspot ou Wi-Fi Direct.
+- Poupança de bateria a fechar a app: desativa a otimização de bateria para o VozLivre.
+- Wi-Fi Direct em Android até 12 exige a localização ligada.
+
+## Limitações
+
+- O áudio e os comandos não são encriptados.
+- Para receber chamadas, a app tem de estar aberta ou em chamada. Não há escuta em segundo plano.
+- Wi-Fi: PCM16 16 kHz. Bluetooth: PCM16 8 kHz. Sem compressão.
+- Não foi possível compilar nem testar este código no ambiente onde foi escrito; a primeira compilação no GitHub Actions pode mostrar erros pequenos a corrigir.
+
+## Compilar o APK
+
+Carrega a pasta para um repositório GitHub e executa **Actions → Build VozLivre APK**. O artefacto `VozLivre-debug-apk` contém `app-debug.apk`. O fluxo fixa o Gradle 8.10.2, exigido pelo plugin Android 8.7.3.
