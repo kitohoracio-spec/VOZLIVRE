@@ -29,7 +29,8 @@ import kotlin.concurrent.thread
 class LanTransport(
     private val ctx: Context,
     private val myId: String,
-    private val nameProvider: () -> String
+    private val nameProvider: () -> String,
+    private val roleProvider: () -> String = { "" }
 ) : Transport {
 
     companion object {
@@ -52,7 +53,7 @@ class LanTransport(
         fun contains(a: InetAddress): Boolean = (ipInt2(a) and mask) == (ipInt and mask)
     }
 
-    private class LanPeer(val id: String, var name: String, var ip: InetAddress, var linkKey: String, var seen: Long)
+    private class LanPeer(val id: String, var name: String, var ip: InetAddress, var linkKey: String, var seen: Long, var role: String = "")
 
     private val links = ConcurrentHashMap<String, Link>()
     private val lanPeers = ConcurrentHashMap<String, LanPeer>()
@@ -110,6 +111,8 @@ class LanTransport(
 
     fun probeAddress(a: InetAddress) { probeQueue.add(a); gate.release() }
 
+    fun hasLinks(): Boolean = links.isNotEmpty()
+
     fun describeLinks(): String {
         if (links.isEmpty()) return "Sem rede local ativa"
         return links.values.sortedBy { it.ifName }.joinToString("\n") { "${it.ifName}: ${it.addr.hostAddress}/${it.prefix}" }
@@ -142,7 +145,7 @@ class LanTransport(
     override fun peers(): List<Peer> =
         lanPeers.values.map {
             val via = links[it.linkKey]?.ifName ?: ""
-            Peer(it.id, it.name, PeerKind.LAN, via, it.ip.hostAddress ?: "")
+            Peer(it.id, it.name, PeerKind.LAN, via, it.ip.hostAddress ?: "", it.role)
         }.sortedBy { it.name }
 
     // ---------------------------------------------------------------- envio
@@ -160,7 +163,7 @@ class LanTransport(
 
     private fun hello(l: Link, dest: InetAddress) {
         val s = l.control ?: return
-        sendTo(s, "HELLO|$myId|${safe(nameProvider())}", dest, CONTROL_PORT, l.key + ">" + dest.hostAddress)
+        sendTo(s, "HELLO|$myId|${safe(nameProvider())}|${roleProvider()}", dest, CONTROL_PORT, l.key + ">" + dest.hostAddress)
     }
 
     // ---------------------------------------------------------------- ciclo de descoberta
@@ -319,7 +322,7 @@ class LanTransport(
     private fun handleControl(p: DatagramPacket, link: Link?) {
         val src = p.address as? Inet4Address ?: return
         val text = String(p.data, p.offset, p.length, Charsets.UTF_8)
-        val parts = text.split("|", limit = 3)
+        val parts = if (text.startsWith("HELLO|")) text.split("|", limit = 4) else text.split("|", limit = 3)
         if (parts.size < 3) return
         val id = parts[1]
         if (id == myId) return
@@ -329,10 +332,11 @@ class LanTransport(
         when (parts[0]) {
             "HELLO" -> {
                 val name = parts[2].replace('_', ' ')
+                val role = if (parts.size > 3) parts[3] else ""
                 val old = lanPeers[id]
-                val peer = old ?: LanPeer(id, name, src, linkKey, now)
-                val changed = old == null || old.name != name || old.ip != src || old.linkKey != linkKey
-                peer.name = name; peer.ip = src; peer.linkKey = linkKey; peer.seen = now
+                val peer = old ?: LanPeer(id, name, src, linkKey, now, role)
+                val changed = old == null || old.name != name || old.ip != src || old.linkKey != linkKey || old.role != role
+                peer.name = name; peer.ip = src; peer.linkKey = linkKey; peer.seen = now; peer.role = role
                 lanPeers[id] = peer
                 if (old == null) {
                     log("Encontrado: $name em ${src.hostAddress} via ${lk.ifName}")

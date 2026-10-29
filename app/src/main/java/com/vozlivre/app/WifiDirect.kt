@@ -96,6 +96,17 @@ class WifiDirect(
         } catch (e: SecurityException) { setStatus("Falta permissão: ${e.message}") }
     }
 
+    fun createGroup() {
+        val m = manager; val ch = channel
+        if (m == null || ch == null) { setStatus("Wi-Fi Direct indisponível"); return }
+        try {
+            m.createGroup(ch, object : WifiP2pManager.ActionListener {
+                override fun onSuccess() { setStatus("Grupo criado. Os clientes já se podem ligar") }
+                override fun onFailure(reason: Int) { setStatus("Não foi possível criar o grupo (${reasonText(reason)})") }
+            })
+        } catch (e: SecurityException) { setStatus("Falta permissão: ${e.message}") }
+    }
+
     fun disconnect() {
         val m = manager; val ch = channel
         if (m == null || ch == null) return

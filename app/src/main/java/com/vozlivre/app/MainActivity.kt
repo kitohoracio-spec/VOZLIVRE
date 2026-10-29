@@ -1,76 +1,74 @@
 package com.vozlivre.app
 
 import android.Manifest
+import android.animation.ObjectAnimator
+import android.animation.PropertyValuesHolder
+import android.animation.ValueAnimator
 import android.app.Activity
 import android.bluetooth.BluetoothAdapter
-import android.content.ClipData
-import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
-import android.graphics.Typeface
+import android.graphics.Color
 import android.graphics.drawable.GradientDrawable
+import android.media.AudioManager
 import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
+import android.provider.Settings
+import android.text.SpannableString
+import android.text.Spanned
+import android.text.style.ForegroundColorSpan
 import android.view.Gravity
 import android.view.View
 import android.view.WindowManager
-import android.widget.Button
-import android.widget.EditText
 import android.widget.FrameLayout
+import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
 import android.widget.Toast
 
-class MainActivity : Activity(), CallEngine.Ui {
+class MainActivity : Activity(), CallEngine.Ui, Host {
 
-    private companion object {
-        val BG = 0xFF101713.toInt()
-        val CARD = 0xFF1B2820.toInt()
-        val TEXT = 0xFFFFFFFF.toInt()
-        val MUTED = 0xFFB8C7BD.toInt()
-        val ACCENT = 0xFF17804A.toInt()
-        val ACCENT_LIGHT = 0xFFA4E8BB.toInt()
-        val RED = 0xFFC0392B.toInt()
-        val GREY = 0xFF2F4036.toInt()
-        const val REQ_ENABLE_BT = 21
-    }
+    private class Tab(val icon: Int, val label: String, val screen: Screen)
+    private class NavItem(val icon: ImageView, val label: TextView, val indicator: View)
+
+    private companion object { const val REQ_ENABLE_BT = 21 }
 
     private lateinit var engine: CallEngine
+    private lateinit var k: Kit
     private val handler = Handler(Looper.getMainLooper())
-    private var tab = 0
-    private var showLog = false
+    private lateinit var root: FrameLayout
+    private var mainView: View? = null
+
+    private var screens: List<Screen> = emptyList()
+    private val navItems = ArrayList<NavItem>()
+    private var body: FrameLayout? = null
+    private var current = 0
+    private var logSection: LogSection? = null
+    private var logPending = false
+
+    private var headerDot: View? = null
+    private var headerStatus: TextView? = null
 
     private val pending = HashMap<Int, () -> Unit>()
     private var reqCode = 100
 
-    private lateinit var nameInput: EditText
-    private lateinit var tabButtons: List<Button>
-    private lateinit var wifiPanel: LinearLayout
-    private lateinit var p2pPanel: LinearLayout
-    private lateinit var btPanel: LinearLayout
-    private lateinit var wifiInfo: TextView
-    private lateinit var ipInput: EditText
-    private lateinit var p2pStatus: TextView
-    private lateinit var p2pList: LinearLayout
-    private lateinit var btStatus: TextView
-    private lateinit var peerList: LinearLayout
-    private lateinit var logView: TextView
-    private lateinit var logBox: LinearLayout
-    private lateinit var logToggle: Button
-
+    // chamada
     private lateinit var callLayer: LinearLayout
+    private lateinit var ring: View
+    private lateinit var avatar: TextView
     private lateinit var callName: TextView
     private lateinit var callStatus: TextView
-    private lateinit var btnAnswer: Button
-    private lateinit var btnReject: Button
-    private lateinit var btnHang: Button
-    private lateinit var btnMute: Button
-    private lateinit var btnSpeaker: Button
+    private lateinit var toolsRow: LinearLayout
+    private lateinit var incomingRow: LinearLayout
+    private lateinit var hangCol: LinearLayout
+    private lateinit var muteBtn: FrameLayout
+    private lateinit var speakerBtn: FrameLayout
+    private var pulse: ObjectAnimator? = null
 
     // ---------------------------------------------------------------- ciclo de vida
 
@@ -78,43 +76,59 @@ class MainActivity : Activity(), CallEngine.Ui {
         super.onCreate(savedInstanceState)
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         engine = (application as VozApp).engine
-        buildUi()
+        k = Kit(this)
+        root = FrameLayout(this)
+        root.setBackgroundColor(Colors.BG)
+        buildOverlay()
+        setContentView(root)
         engine.start()
-        val base = ArrayList<String>()
-        base.add(Manifest.permission.RECORD_AUDIO)
-        if (Build.VERSION.SDK_INT >= 33) base.add(Manifest.permission.POST_NOTIFICATIONS)
+        val base = ArrayList<String>(micPerms())
+        base.addAll(notifPerms())
         withPerms(base) { }
-        if (btPerms().all { checkSelfPermission(it) == PackageManager.PERMISSION_GRANTED }) engine.startBluetooth()
+        if (allGranted(btPerms())) engine.startBluetooth()
+        showMain()
     }
 
     override fun onStart() {
         super.onStart()
         engine.ui = this
-        refreshAll()
+        refreshHeader()
+        onStateChanged()
+        screens.getOrNull(current)?.refresh()
     }
 
     override fun onStop() {
         if (engine.ui === this) engine.ui = null
         handler.removeCallbacks(ticker)
+        setPulse(false)
         super.onStop()
     }
 
     override fun onDestroy() {
-        if (isFinishing && engine.state == CallEngine.State.IDLE) engine.stopAll()
+        if (isFinishing && engine.state == CallEngine.State.IDLE && !engine.listenInBackground) engine.stopAll()
         super.onDestroy()
     }
 
-    // ---------------------------------------------------------------- permissões
+    // ---------------------------------------------------------------- Host
 
-    private fun p2pPerms(): List<String> =
+    override fun toast(m: String) { Toast.makeText(this, m, Toast.LENGTH_SHORT).show() }
+
+    override fun allGranted(perms: List<String>): Boolean = perms.all { checkSelfPermission(it) == PackageManager.PERMISSION_GRANTED }
+
+    override fun micPerms(): List<String> = listOf(Manifest.permission.RECORD_AUDIO)
+
+    override fun notifPerms(): List<String> =
+        if (Build.VERSION.SDK_INT >= 33) listOf(Manifest.permission.POST_NOTIFICATIONS) else emptyList()
+
+    override fun p2pPerms(): List<String> =
         if (Build.VERSION.SDK_INT >= 33) listOf(Manifest.permission.NEARBY_WIFI_DEVICES)
         else listOf(Manifest.permission.ACCESS_FINE_LOCATION)
 
-    private fun btPerms(): List<String> =
+    override fun btPerms(): List<String> =
         if (Build.VERSION.SDK_INT >= 31) listOf(Manifest.permission.BLUETOOTH_CONNECT, Manifest.permission.BLUETOOTH_SCAN)
         else listOf(Manifest.permission.ACCESS_FINE_LOCATION)
 
-    private fun withPerms(perms: List<String>, whenOk: () -> Unit) {
+    override fun withPerms(perms: List<String>, whenOk: () -> Unit) {
         val missing = perms.filter { checkSelfPermission(it) != PackageManager.PERMISSION_GRANTED }
         if (missing.isEmpty()) { whenOk(); return }
         val code = reqCode++
@@ -124,9 +138,13 @@ class MainActivity : Activity(), CallEngine.Ui {
 
     override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
-        val action = pending.remove(requestCode) ?: return
-        if (grantResults.isNotEmpty() && grantResults.all { it == PackageManager.PERMISSION_GRANTED }) action()
-        else toast("Permissão necessária não concedida")
+        val action = pending.remove(requestCode)
+        if (action != null) {
+            if (grantResults.isNotEmpty() && grantResults.all { it == PackageManager.PERMISSION_GRANTED }) action()
+            else toast("Permissão necessária não concedida")
+        }
+        if (allGranted(btPerms())) engine.startBluetooth()
+        screens.getOrNull(current)?.refresh()
     }
 
     @Deprecated("Deprecated in Java")
@@ -136,271 +154,10 @@ class MainActivity : Activity(), CallEngine.Ui {
             engine.startBluetooth()
             engine.bt.startScan()
         }
+        screens.getOrNull(current)?.refresh()
     }
 
-    // ---------------------------------------------------------------- construção da interface
-
-    private fun dp(v: Int) = (v * resources.displayMetrics.density + 0.5f).toInt()
-
-    private fun tv(text: String, size: Float = 14f, color: Int = TEXT): TextView =
-        TextView(this).apply { this.text = text; textSize = size; setTextColor(color) }
-
-    private fun box(color: Int, radius: Int = 12): GradientDrawable =
-        GradientDrawable().apply { setColor(color); cornerRadius = dp(radius).toFloat() }
-
-    private fun btn(text: String, color: Int = ACCENT, onClick: () -> Unit): Button =
-        Button(this).apply {
-            this.text = text
-            isAllCaps = false
-            setTextColor(TEXT)
-            background = box(color)
-            setPadding(dp(14), dp(8), dp(14), dp(8))
-            setOnClickListener { onClick() }
-        }
-
-    private fun lp(w: Int = -1, h: Int = -2, top: Int = 0, bottom: Int = 0, weight: Float = 0f) =
-        LinearLayout.LayoutParams(w, h, weight).apply { topMargin = dp(top); bottomMargin = dp(bottom) }
-
-    private fun buildUi() {
-        val root = FrameLayout(this).apply { setBackgroundColor(BG) }
-        val col = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(dp(16), dp(24), dp(16), dp(24))
-        }
-
-        col.addView(tv("VozLivre", 30f, ACCENT_LIGHT).apply { gravity = Gravity.CENTER })
-        col.addView(tv("Chamadas de voz sem Internet", 14f, MUTED).apply { gravity = Gravity.CENTER }, lp(bottom = 14))
-
-        nameInput = EditText(this).apply {
-            hint = "O teu nome"
-            setSingleLine(true)
-            setTextColor(TEXT); setHintTextColor(MUTED)
-            background = box(CARD)
-            setPadding(dp(14), dp(10), dp(14), dp(10))
-            setText(engine.displayName)
-        }
-        val nameRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
-        nameRow.addView(nameInput, lp(0, -2, weight = 1f))
-        nameRow.addView(btn("Guardar") {
-            engine.setName(nameInput.text.toString())
-            toast("Nome guardado: ${engine.displayName}")
-        }, lp(-2, -2).apply { leftMargin = dp(8) })
-        col.addView(nameRow, lp(bottom = 12))
-
-        val tabs = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
-        val names = listOf("Wi-Fi", "Wi-Fi Direct", "Bluetooth")
-        tabButtons = names.mapIndexed { i, n -> btn(n, GREY) { tab = i; refreshAll() } }
-        tabButtons.forEachIndexed { i, b -> tabs.addView(b, lp(0, -2, weight = 1f).apply { if (i > 0) leftMargin = dp(6) }) }
-        col.addView(tabs, lp(bottom = 10))
-
-        // Painel Wi-Fi
-        wifiPanel = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
-        wifiInfo = tv("", 13f, MUTED)
-        wifiPanel.addView(wifiInfo, lp(bottom = 8))
-        wifiPanel.addView(tv("Se os telemóveis não se encontrarem sozinhos, escreve o IP do outro (aparece no ecrã dele).", 13f, MUTED), lp(bottom = 6))
-        ipInput = EditText(this).apply {
-            hint = "ex.: 192.168.1.23"
-            setSingleLine(true)
-            setTextColor(TEXT); setHintTextColor(MUTED)
-            background = box(CARD)
-            setPadding(dp(14), dp(10), dp(14), dp(10))
-        }
-        val ipRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
-        ipRow.addView(ipInput, lp(0, -2, weight = 1f))
-        ipRow.addView(btn("Procurar") {
-            val ip = ipInput.text.toString().trim()
-            if (ip.isNotEmpty()) engine.lan.probe(ip)
-        }, lp(-2, -2).apply { leftMargin = dp(8) })
-        wifiPanel.addView(ipRow)
-        col.addView(wifiPanel, lp(bottom = 8))
-
-        // Painel Wi-Fi Direct
-        p2pPanel = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
-        val p2pRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
-        p2pRow.addView(btn("Procurar telemóveis") {
-            withPerms(p2pPerms()) { engine.p2p.discover() }
-        }, lp(0, -2, weight = 1f))
-        p2pRow.addView(btn("Terminar grupo", GREY) { engine.p2p.disconnect() }, lp(0, -2, weight = 1f).apply { leftMargin = dp(8) })
-        p2pPanel.addView(p2pRow, lp(bottom = 6))
-        p2pStatus = tv("", 13f, MUTED)
-        p2pPanel.addView(p2pStatus, lp(bottom = 6))
-        p2pPanel.addView(tv("Faz Procurar nos dois telemóveis, toca em Ligar num deles e aceita o convite no outro. Precisa do Wi-Fi ligado (e da localização ligada até ao Android 12).", 12f, MUTED), lp(bottom = 6))
-        p2pList = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
-        p2pPanel.addView(p2pList)
-        col.addView(p2pPanel, lp(bottom = 8))
-
-        // Painel Bluetooth
-        btPanel = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
-        val btRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
-        btRow.addView(btn("Procurar") { startBluetoothScan() }, lp(0, -2, weight = 1f))
-        btRow.addView(btn("Tornar visível", GREY) {
-            withPerms(btPerms()) {
-                startActivity(Intent(BluetoothAdapter.ACTION_REQUEST_DISCOVERABLE).putExtra(BluetoothAdapter.EXTRA_DISCOVERABLE_DURATION, 120))
-            }
-        }, lp(0, -2, weight = 1f).apply { leftMargin = dp(8) })
-        btPanel.addView(btRow, lp(bottom = 6))
-        btStatus = tv("", 13f, MUTED)
-        btPanel.addView(btStatus, lp(bottom = 6))
-        btPanel.addView(tv("Os dois telemóveis precisam de ter o VozLivre aberto. A qualidade é menor (8 kHz) e o alcance é de poucos metros.", 12f, MUTED))
-        col.addView(btPanel, lp(bottom = 8))
-
-        col.addView(tv("Pessoas encontradas", 18f), lp(top = 6, bottom = 6))
-        peerList = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
-        col.addView(peerList)
-
-        // Diagnóstico
-        logToggle = btn("Mostrar diagnóstico", GREY) { showLog = !showLog; refreshAll() }
-        col.addView(logToggle, lp(top = 16))
-        logBox = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
-        logBox.addView(btn("Copiar registo", GREY) {
-            val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-            cm.setPrimaryClip(ClipData.newPlainText("VozLivre", engine.logText()))
-            toast("Registo copiado")
-        }, lp(top = 8, bottom = 6))
-        logView = tv("", 10f, MUTED).apply { typeface = Typeface.MONOSPACE; setTextIsSelectable(true) }
-        logBox.addView(logView)
-        col.addView(logBox)
-
-        root.addView(ScrollView(this).apply { addView(col) })
-
-        // Camada de chamada
-        callLayer = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            gravity = Gravity.CENTER_HORIZONTAL
-            setBackgroundColor(BG)
-            setPadding(dp(24), dp(80), dp(24), dp(48))
-            visibility = View.GONE
-            isClickable = true
-        }
-        callName = tv("", 30f).apply { gravity = Gravity.CENTER }
-        callStatus = tv("", 18f, ACCENT_LIGHT).apply { gravity = Gravity.CENTER }
-        callLayer.addView(callName, lp(top = 40))
-        callLayer.addView(callStatus, lp(top = 12))
-        callLayer.addView(View(this), lp(-1, 0, weight = 1f))
-        btnMute = btn("Silenciar", GREY) { engine.toggleMute() }
-        btnSpeaker = btn("Altifalante", GREY) { engine.toggleSpeaker() }
-        val tools = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
-        tools.addView(btnMute, lp(0, -2, weight = 1f))
-        tools.addView(btnSpeaker, lp(0, -2, weight = 1f).apply { leftMargin = dp(10) })
-        callLayer.addView(tools, lp(bottom = 16))
-        btnAnswer = btn("Atender", ACCENT) { engine.answer() }
-        btnReject = btn("Recusar", RED) { engine.reject() }
-        btnHang = btn("Terminar chamada", RED) { engine.hangup() }
-        callLayer.addView(btnAnswer, lp(bottom = 10))
-        callLayer.addView(btnReject, lp(bottom = 10))
-        callLayer.addView(btnHang)
-        root.addView(callLayer, FrameLayout.LayoutParams(-1, -1))
-
-        setContentView(root)
-    }
-
-    // ---------------------------------------------------------------- atualização
-
-    private fun refreshAll() {
-        tabButtons.forEachIndexed { i, b -> b.background = box(if (i == tab) ACCENT else GREY) }
-        wifiPanel.visibility = if (tab == 0) View.VISIBLE else View.GONE
-        p2pPanel.visibility = if (tab == 1) View.VISIBLE else View.GONE
-        btPanel.visibility = if (tab == 2) View.VISIBLE else View.GONE
-        logBox.visibility = if (showLog) View.VISIBLE else View.GONE
-        logToggle.text = if (showLog) "Esconder diagnóstico" else "Mostrar diagnóstico"
-        onPeersChanged()
-        onLog()
-        onStateChanged()
-    }
-
-    override fun onPeersChanged() {
-        wifiInfo.text = "O teu IP:\n" + engine.lan.describeLinks()
-        p2pStatus.text = engine.p2p.status
-        btStatus.text = when {
-            !engine.bt.available -> "Este telemóvel não tem Bluetooth"
-            !engine.bt.isEnabled() -> "Bluetooth desligado. Toca em Procurar para ligar."
-            else -> "Bluetooth ligado"
-        }
-
-        p2pList.removeAllViews()
-        if (tab == 1) {
-            for (d in engine.p2p.devices) {
-                val row = LinearLayout(this).apply {
-                    orientation = LinearLayout.HORIZONTAL
-                    gravity = Gravity.CENTER_VERTICAL
-                    background = box(CARD)
-                    setPadding(dp(12), dp(8), dp(12), dp(8))
-                }
-                row.addView(tv("${d.deviceName.ifBlank { "Sem nome" }}\n${p2pState(d.status)}", 15f), lp(0, -2, weight = 1f))
-                row.addView(btn("Ligar") { engine.p2p.connect(d) }, lp(-2, -2))
-                p2pList.addView(row, lp(bottom = 8))
-            }
-        }
-
-        peerList.removeAllViews()
-        val shown = engine.allPeers().filter {
-            when (tab) {
-                0 -> it.kind == PeerKind.LAN && !it.isP2p
-                1 -> it.kind == PeerKind.LAN && it.isP2p
-                else -> it.kind == PeerKind.BLUETOOTH
-            }
-        }
-        if (shown.isEmpty()) {
-            peerList.addView(tv("Ninguém encontrado ainda. Abre o VozLivre no outro telemóvel.", 14f, MUTED))
-        }
-        val busy = engine.state != CallEngine.State.IDLE
-        for (p in shown) {
-            val row = LinearLayout(this).apply {
-                orientation = LinearLayout.HORIZONTAL
-                gravity = Gravity.CENTER_VERTICAL
-                background = box(CARD)
-                setPadding(dp(12), dp(8), dp(12), dp(8))
-            }
-            row.addView(tv("${p.name}\n${p.detail}", 16f), lp(0, -2, weight = 1f))
-            row.addView(btn("Ligar") {
-                withPerms(listOf(Manifest.permission.RECORD_AUDIO)) { engine.startCall(p) }
-            }.apply { isEnabled = !busy; alpha = if (busy) 0.4f else 1f }, lp(-2, -2))
-            peerList.addView(row, lp(bottom = 8))
-        }
-    }
-
-    override fun onLog() {
-        if (showLog) logView.text = engine.logText()
-    }
-
-    override fun onToast(msg: String) { toast(msg) }
-
-    override fun onStateChanged() {
-        val st = engine.state
-        callLayer.visibility = if (st == CallEngine.State.IDLE) View.GONE else View.VISIBLE
-        val p = engine.peer
-        callName.text = p?.name ?: ""
-        btnAnswer.visibility = if (st == CallEngine.State.INCOMING) View.VISIBLE else View.GONE
-        btnReject.visibility = if (st == CallEngine.State.INCOMING) View.VISIBLE else View.GONE
-        btnHang.visibility = if (st == CallEngine.State.OUTGOING || st == CallEngine.State.ACTIVE) View.VISIBLE else View.GONE
-        val tools = if (st == CallEngine.State.ACTIVE) View.VISIBLE else View.GONE
-        btnMute.visibility = tools; btnSpeaker.visibility = tools
-        btnMute.text = if (engine.muted) "Ativar microfone" else "Silenciar"
-        btnMute.background = box(if (engine.muted) RED else GREY)
-        btnSpeaker.background = box(if (engine.speaker) ACCENT else GREY)
-        updateCallText()
-        handler.removeCallbacks(ticker)
-        if (st == CallEngine.State.ACTIVE) handler.postDelayed(ticker, 1000)
-        onPeersChanged()
-    }
-
-    private val ticker = object : Runnable {
-        override fun run() {
-            updateCallText()
-            if (engine.state == CallEngine.State.ACTIVE) handler.postDelayed(this, 1000)
-        }
-    }
-
-    private fun updateCallText() {
-        if (engine.state == CallEngine.State.ACTIVE) {
-            val s = (SystemClock.elapsedRealtime() - engine.activeSince) / 1000
-            callStatus.text = "Em chamada  %02d:%02d".format(s / 60, s % 60)
-        } else callStatus.text = engine.statusText
-    }
-
-    // ---------------------------------------------------------------- Bluetooth
-
-    private fun startBluetoothScan() {
+    override fun scanBluetooth() {
         withPerms(btPerms()) {
             if (!engine.bt.available) { toast("Sem Bluetooth neste telemóvel"); return@withPerms }
             if (!engine.bt.isEnabled()) {
@@ -412,13 +169,379 @@ class MainActivity : Activity(), CallEngine.Ui {
         }
     }
 
-    private fun p2pState(v: Int) = when (v) {
-        android.net.wifi.p2p.WifiP2pDevice.AVAILABLE -> "disponível"
-        android.net.wifi.p2p.WifiP2pDevice.INVITED -> "convite enviado"
-        android.net.wifi.p2p.WifiP2pDevice.CONNECTED -> "ligado"
-        android.net.wifi.p2p.WifiP2pDevice.FAILED -> "falhou"
-        else -> "indisponível"
+    override fun makeDiscoverable() {
+        withPerms(btPerms()) {
+            startActivity(Intent(BluetoothAdapter.ACTION_REQUEST_DISCOVERABLE).putExtra(BluetoothAdapter.EXTRA_DISCOVERABLE_DURATION, 120))
+        }
     }
 
-    private fun toast(m: String) = Toast.makeText(this, m, Toast.LENGTH_SHORT).show()
+    override fun scanAll() {
+        engine.lan.wake()
+        val all = (p2pPerms() + btPerms()).distinct()
+        withPerms(all) {
+            if (engine.bt.available && engine.bt.isEnabled()) { engine.startBluetooth(); engine.bt.startScan() }
+            engine.p2p.discover()
+        }
+    }
+
+    override fun openBatterySettings() {
+        try { startActivity(Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS)) }
+        catch (_: Exception) { toast("Abre as definições de bateria do Android") }
+    }
+
+    override fun changeMode() {
+        if (engine.state != CallEngine.State.IDLE) { toast("Termina a chamada primeiro"); return }
+        engine.setMode(null)
+        showMain()
+    }
+
+    override fun goTo(index: Int) { select(index) }
+
+    override fun getVolume(): Int {
+        val am = getSystemService(Context.AUDIO_SERVICE) as AudioManager
+        val max = am.getStreamMaxVolume(AudioManager.STREAM_VOICE_CALL).coerceAtLeast(1)
+        return am.getStreamVolume(AudioManager.STREAM_VOICE_CALL) * 100 / max
+    }
+
+    override fun setVolume(pct: Int) {
+        val am = getSystemService(Context.AUDIO_SERVICE) as AudioManager
+        val max = am.getStreamMaxVolume(AudioManager.STREAM_VOICE_CALL)
+        try { am.setStreamVolume(AudioManager.STREAM_VOICE_CALL, pct * max / 100, 0) } catch (_: Exception) {}
+    }
+
+    // ---------------------------------------------------------------- escolha de modo e estrutura
+
+    private fun showMain() {
+        mainView?.let { root.removeView(it) }
+        logSection = null
+        navItems.clear()
+        screens = emptyList()
+        val v = if (engine.mode == null) buildChooser() else buildShell()
+        mainView = v
+        root.addView(v, 0, FrameLayout.LayoutParams(-1, -1))
+        refreshHeader()
+    }
+
+    private fun buildChooser(): View {
+        val sv = ScrollView(this)
+        sv.isFillViewport = true
+        val col = LinearLayout(this)
+        col.orientation = LinearLayout.VERTICAL
+        col.gravity = Gravity.CENTER_HORIZONTAL
+        col.setPadding(k.dp(24), k.dp(56), k.dp(24), k.dp(24))
+
+        val sp = SpannableString("VozLivre")
+        sp.setSpan(ForegroundColorSpan(Colors.GREEN), 3, 8, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+        col.addView(k.text(sp, 36f, Colors.TEXT, true))
+        col.addView(k.muted("Escolhe como vais usar esta app neste telemóvel.", 15f), k.lp(top = 8, bottom = 28))
+
+        fun option(icon: Int, title: String, desc: String, mode: String) {
+            val c = k.card(true)
+            c.isClickable = true
+            val top = LinearLayout(this)
+            top.orientation = LinearLayout.HORIZONTAL
+            top.gravity = Gravity.CENTER_VERTICAL
+            top.addView(k.icon(icon, Colors.GREEN, 30))
+            top.addView(k.text(title, 20f, Colors.TEXT, true), k.lp(0, -2, left = 12, weight = 1f))
+            c.addView(top)
+            c.addView(k.muted(desc, 14f), k.lp(top = 10))
+            c.setOnClickListener {
+                engine.setMode(mode)
+                showMain()
+            }
+            col.addView(c, k.lp(bottom = 16))
+        }
+        option(R.drawable.ic_server, "Servidor",
+            "Painel de controlo completo: rede, clientes, chamadas, segurança, registos e definições avançadas.", "server")
+        option(R.drawable.ic_call, "Cliente",
+            "Interface simples: liga ao servidor, faz chamadas e controla o áudio.", "client")
+
+        col.addView(View(this), k.lp(-1, 0, weight = 1f))
+        col.addView(k.muted(Brand.SIGNATURE, 12f), k.lp(top = 16))
+        sv.addView(col, FrameLayout.LayoutParams(-1, -2))
+        return sv
+    }
+
+    private fun buildShell(): View {
+        val server = engine.mode == "server"
+        val col = LinearLayout(this)
+        col.orientation = LinearLayout.VERTICAL
+        col.addView(buildHeader(server))
+        val b = FrameLayout(this)
+        body = b
+        col.addView(b, LinearLayout.LayoutParams(-1, 0, 1f))
+        val tabs = if (server) serverTabs() else clientTabs()
+        screens = tabs.map { it.screen }
+        col.addView(buildNav(tabs))
+        current = 0
+        select(0)
+        return col
+    }
+
+    private fun serverTabs(): List<Tab> {
+        val log = LogSection(k, engine, this)
+        logSection = log
+        return listOf(
+            Tab(R.drawable.ic_wifi, "Ligações", Screen(k, listOf(
+                ServerOverviewSection(k, engine), NetworkSection(k, engine),
+                P2pSection(k, engine, this, true), BtSection(k, engine, this)))),
+            Tab(R.drawable.ic_people, "Clientes", Screen(k, listOf(ClientsSection(k, engine, this)))),
+            Tab(R.drawable.ic_call, "Chamadas", Screen(k, listOf(
+                QuickDialSection(k, engine, this), CallStatsSection(k, engine), HistorySection(k, engine, 30)))),
+            Tab(R.drawable.ic_pulse, "Diagnóstico", Screen(k, listOf(PeersTableSection(k, engine), log))),
+            Tab(R.drawable.ic_settings, "Definições", Screen(k, listOf(
+                IdentitySection(k, engine, this), PermissionsSection(k, this), BackgroundSection(k, engine, this),
+                AdvancedSection(k, engine, this), ModeSection(k, engine, this), CreditsSection(k))))
+        )
+    }
+
+    private fun clientTabs(): List<Tab> = listOf(
+        Tab(R.drawable.ic_wifi, "Ligação", Screen(k, listOf(
+            ClientLinkStatusSection(k, engine, this), ServerListSection(k, engine, this),
+            OtherMethodsSection(k, engine, this), IdentitySection(k, engine, this)))),
+        Tab(R.drawable.ic_call, "Chamadas", Screen(k, listOf(
+            CallServerSection(k, engine, this), HistorySection(k, engine, 10, "Chamadas recentes")))),
+        Tab(R.drawable.ic_speaker, "Áudio", Screen(k, listOf(AudioControlsSection(k, engine, this)))),
+        Tab(R.drawable.ic_bars, "Estado", Screen(k, listOf(
+            ClientIndicatorsSection(k, engine, this), PermissionsSection(k, this), BackgroundSection(k, engine, this),
+            ModeSection(k, engine, this), CreditsSection(k))))
+    )
+
+    private fun buildHeader(server: Boolean): View {
+        val h = LinearLayout(this)
+        h.orientation = LinearLayout.HORIZONTAL
+        h.gravity = Gravity.CENTER_VERTICAL
+        h.setPadding(k.dp(16), k.dp(14), k.dp(16), k.dp(8))
+        val sp = SpannableString("VozLivre")
+        sp.setSpan(ForegroundColorSpan(Colors.GREEN), 3, 8, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+        h.addView(k.text(sp, 22f, Colors.TEXT, true))
+        h.addView(k.pill(if (server) "SERVIDOR" else "CLIENTE"), k.lp(-2, -2, left = 10))
+        h.addView(View(this), k.lp(0, 1, weight = 1f))
+        val d = k.dot(Colors.AMBER, 12)
+        headerDot = d
+        h.addView(d)
+        val st = k.text("", 12f, Colors.MUTED)
+        headerStatus = st
+        h.addView(st, k.lp(-2, -2, left = 8))
+        return h
+    }
+
+    private fun buildNav(tabs: List<Tab>): View {
+        val wrap = LinearLayout(this)
+        wrap.orientation = LinearLayout.VERTICAL
+        wrap.setBackgroundColor(Colors.SURFACE)
+        wrap.addView(k.divider())
+        val bar = LinearLayout(this)
+        bar.orientation = LinearLayout.HORIZONTAL
+        for ((i, t) in tabs.withIndex()) {
+            val item = LinearLayout(this)
+            item.orientation = LinearLayout.VERTICAL
+            item.gravity = Gravity.CENTER_HORIZONTAL
+            item.setPadding(0, k.dp(6), 0, k.dp(8))
+            val ind = View(this)
+            ind.background = k.shape(Colors.GREEN, 3)
+            k.glow(ind, Colors.GREEN, 4)
+            item.addView(ind, k.lp(k.dp(22), k.dp(3), bottom = 6))
+            val ic = k.icon(t.icon, Colors.MUTED, 22)
+            item.addView(ic)
+            val tx = k.text(t.label, 10.5f, Colors.MUTED)
+            item.addView(tx, k.lp(-2, -2, top = 3))
+            item.setOnClickListener { select(i) }
+            navItems.add(NavItem(ic, tx, ind))
+            bar.addView(item, k.lp(0, -2, weight = 1f))
+        }
+        wrap.addView(bar)
+        return wrap
+    }
+
+    private fun select(i: Int) {
+        val b = body ?: return
+        if (i < 0 || i >= screens.size) return
+        current = i
+        b.removeAllViews()
+        b.addView(screens[i].view, FrameLayout.LayoutParams(-1, -1))
+        for ((j, n) in navItems.withIndex()) {
+            val sel = j == i
+            n.icon.setColorFilter(if (sel) Colors.GREEN else Colors.MUTED)
+            n.label.setTextColor(if (sel) Colors.GREEN else Colors.MUTED)
+            n.indicator.visibility = if (sel) View.VISIBLE else View.INVISIBLE
+        }
+        screens[i].refresh()
+    }
+
+    private fun refreshHeader() {
+        val d = headerDot ?: return
+        val s = headerStatus ?: return
+        if (engine.mode == "server") {
+            val up = engine.lan.hasLinks()
+            k.recolorDot(d, if (up) Colors.GREEN else Colors.AMBER)
+            s.text = if (up) "Ativo" else "Sem rede"
+        } else {
+            val ok = engine.selectedServerPeer() != null
+            k.recolorDot(d, if (ok) Colors.GREEN else Colors.AMBER)
+            s.text = if (ok) "Ligado" else "Sem servidor"
+        }
+    }
+
+    // ---------------------------------------------------------------- CallEngine.Ui
+
+    override fun onPeersChanged() {
+        refreshHeader()
+        screens.getOrNull(current)?.refresh()
+    }
+
+    override fun onLog() {
+        if (logPending) return
+        logPending = true
+        handler.postDelayed({
+            logPending = false
+            logSection?.refresh()
+        }, 400)
+    }
+
+    override fun onToast(msg: String) { toast(msg) }
+
+    override fun onStateChanged() {
+        val st = engine.state
+        callLayer.visibility = if (st == CallEngine.State.IDLE) View.GONE else View.VISIBLE
+        val p = engine.peer
+        callName.text = p?.name ?: ""
+        avatar.text = p?.name?.trim()?.firstOrNull()?.uppercase() ?: "?"
+        incomingRow.visibility = if (st == CallEngine.State.INCOMING) View.VISIBLE else View.GONE
+        hangCol.visibility = if (st == CallEngine.State.OUTGOING || st == CallEngine.State.ACTIVE) View.VISIBLE else View.GONE
+        toolsRow.visibility = if (st == CallEngine.State.ACTIVE) View.VISIBLE else View.GONE
+        muteBtn.background = circle(if (engine.muted) Colors.RED else Colors.CARD_HI)
+        (muteBtn.tag as ImageView).setColorFilter(if (engine.muted) Color.WHITE else Colors.TEXT)
+        speakerBtn.background = circle(if (engine.speaker) Colors.GREEN else Colors.CARD_HI)
+        (speakerBtn.tag as ImageView).setColorFilter(if (engine.speaker) Color.BLACK else Colors.TEXT)
+        updateCallText()
+        setPulse(st == CallEngine.State.OUTGOING || st == CallEngine.State.INCOMING)
+        handler.removeCallbacks(ticker)
+        if (st == CallEngine.State.ACTIVE) handler.postDelayed(ticker, 1000)
+        refreshHeader()
+        screens.getOrNull(current)?.refresh()
+    }
+
+    // ---------------------------------------------------------------- ecrã de chamada
+
+    private fun circle(color: Int): GradientDrawable {
+        val g = GradientDrawable()
+        g.shape = GradientDrawable.OVAL
+        g.setColor(color)
+        return g
+    }
+
+    private fun round(icon: Int, fill: Int, rotate: Float = 0f, tint: Int = Color.WHITE, glow: Boolean = false, onClick: () -> Unit): FrameLayout {
+        val f = FrameLayout(this)
+        f.background = circle(fill)
+        f.setOnClickListener { onClick() }
+        val img = ImageView(this)
+        img.setImageResource(icon)
+        img.setColorFilter(tint)
+        img.rotation = rotate
+        f.addView(img, FrameLayout.LayoutParams(k.dp(30), k.dp(30), Gravity.CENTER))
+        f.layoutParams = LinearLayout.LayoutParams(k.dp(72), k.dp(72))
+        f.tag = img
+        if (glow) k.glow(f, fill, 8)
+        return f
+    }
+
+    private fun labeled(b: View, label: String, weight: Float = 0f): LinearLayout {
+        val c = LinearLayout(this)
+        c.orientation = LinearLayout.VERTICAL
+        c.gravity = Gravity.CENTER_HORIZONTAL
+        c.addView(b)
+        val t = k.muted(label, 13f)
+        t.gravity = Gravity.CENTER
+        c.addView(t, k.lp(top = 6))
+        if (weight > 0f) c.layoutParams = LinearLayout.LayoutParams(0, -2, weight)
+        return c
+    }
+
+    private fun buildOverlay() {
+        callLayer = LinearLayout(this)
+        callLayer.orientation = LinearLayout.VERTICAL
+        callLayer.gravity = Gravity.CENTER_HORIZONTAL
+        callLayer.setBackgroundColor(Colors.BG)
+        callLayer.setPadding(k.dp(24), k.dp(64), k.dp(24), k.dp(56))
+        callLayer.visibility = View.GONE
+        callLayer.isClickable = true
+
+        val ringBox = FrameLayout(this)
+        ring = View(this)
+        ring.background = k.shape(Colors.alpha(Colors.GREEN, 0x10), 200, Colors.alpha(Colors.GREEN, 0x55), 2)
+        ringBox.addView(ring, FrameLayout.LayoutParams(k.dp(190), k.dp(190), Gravity.CENTER))
+        avatar = k.avatar("?", 120)
+        avatar.textSize = 48f
+        ringBox.addView(avatar, FrameLayout.LayoutParams(k.dp(120), k.dp(120), Gravity.CENTER))
+        callLayer.addView(ringBox, LinearLayout.LayoutParams(k.dp(190), k.dp(190)))
+
+        callName = k.text("", 28f, Colors.TEXT, true)
+        callName.gravity = Gravity.CENTER
+        callStatus = k.text("", 17f, Colors.GREEN)
+        callStatus.gravity = Gravity.CENTER
+        callLayer.addView(callName, k.lp(top = 20))
+        callLayer.addView(callStatus, k.lp(top = 8))
+        callLayer.addView(View(this), k.lp(-1, 0, weight = 1f))
+
+        muteBtn = round(R.drawable.ic_mic, Colors.CARD_HI, tint = Colors.TEXT) { engine.toggleMute() }
+        speakerBtn = round(R.drawable.ic_speaker, Colors.CARD_HI, tint = Colors.TEXT) { engine.toggleSpeaker() }
+        toolsRow = LinearLayout(this)
+        toolsRow.orientation = LinearLayout.HORIZONTAL
+        toolsRow.addView(labeled(muteBtn, "Silenciar", 1f))
+        toolsRow.addView(labeled(speakerBtn, "Altifalante", 1f))
+        callLayer.addView(toolsRow, k.lp(bottom = 28))
+
+        val reject = round(R.drawable.ic_call, Colors.RED, 135f, glow = true) { engine.reject() }
+        val answer = round(R.drawable.ic_call, Colors.GREEN, 0f, Color.BLACK, true) { engine.answer() }
+        incomingRow = LinearLayout(this)
+        incomingRow.orientation = LinearLayout.HORIZONTAL
+        incomingRow.addView(labeled(reject, "Recusar", 1f))
+        incomingRow.addView(labeled(answer, "Atender", 1f))
+        callLayer.addView(incomingRow)
+
+        val hang = round(R.drawable.ic_call, Colors.RED, 135f, glow = true) { engine.hangup() }
+        hangCol = labeled(hang, "Terminar")
+        callLayer.addView(hangCol)
+
+        root.addView(callLayer, FrameLayout.LayoutParams(-1, -1))
+    }
+
+    private fun setPulse(on: Boolean) {
+        if (on) {
+            if (pulse == null) {
+                val a = ObjectAnimator.ofPropertyValuesHolder(
+                    ring,
+                    PropertyValuesHolder.ofFloat("scaleX", 1f, 1.12f),
+                    PropertyValuesHolder.ofFloat("scaleY", 1f, 1.12f),
+                    PropertyValuesHolder.ofFloat("alpha", 1f, 0.35f)
+                )
+                a.duration = 1100
+                a.repeatCount = ValueAnimator.INFINITE
+                a.repeatMode = ValueAnimator.REVERSE
+                a.start()
+                pulse = a
+            }
+        } else {
+            pulse?.cancel()
+            pulse = null
+            ring.scaleX = 1f; ring.scaleY = 1f; ring.alpha = 1f
+        }
+    }
+
+    private val ticker = object : Runnable {
+        override fun run() {
+            updateCallText()
+            if (engine.state == CallEngine.State.ACTIVE) handler.postDelayed(this, 1000)
+        }
+    }
+
+    private fun updateCallText() {
+        if (engine.state == CallEngine.State.ACTIVE) {
+            val s = ((SystemClock.elapsedRealtime() - engine.activeSince) / 1000).toInt()
+            callStatus.text = "Em chamada  " + formatSeconds(s)
+        } else {
+            callStatus.text = engine.statusText
+        }
+    }
 }

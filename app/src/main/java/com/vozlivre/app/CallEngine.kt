@@ -1,6 +1,11 @@
 package com.vozlivre.app
 
+import android.app.Notification
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.PendingIntent
 import android.content.Context
+import android.content.Intent
 import android.media.Ringtone
 import android.media.RingtoneManager
 import android.net.wifi.WifiManager
@@ -47,7 +52,11 @@ class CallEngine(private val app: Context) : TransportListener {
     var displayName: String = prefs.getString("name", "Utilizador") ?: "Utilizador"
         private set
 
-    val lan = LanTransport(app, myId) { displayName }
+    /** "server", "client" ou null (ainda não escolhido). */
+    var mode: String? = prefs.getString("mode", null)
+        private set
+
+    val lan = LanTransport(app, myId, { displayName }, { if (mode == "server") "S" else if (mode == "client") "C" else "" })
     val bt = BluetoothTransport(app)
     val p2p = WifiDirect(app, lan, { log(it) }, { ui?.onPeersChanged() })
 
@@ -73,9 +82,16 @@ class CallEngine(private val app: Context) : TransportListener {
     private val logLines = ArrayDeque<String>()
     private val fmt = SimpleDateFormat("HH:mm:ss.SSS", Locale.US)
 
+    var listenInBackground: Boolean = prefs.getBoolean("listen", false)
+        private set
+    private var lastDecryptLog = 0L
+
+    val usingDefaultPassword: Boolean get() = prefs.getString("pw", "").isNullOrBlank()
+
     init {
         lan.listener = this
         bt.listener = this
+        try { Secure.setPassword(prefs.getString("pw", "") ?: "") } catch (e: Exception) { log("Chave não iniciada: ${e.message}") }
     }
 
     // ---------------------------------------------------------------- ciclo de vida
@@ -86,6 +102,23 @@ class CallEngine(private val app: Context) : TransportListener {
         lan.start()
         p2p.start()
         log("Motor iniciado. O meu id: $myId")
+        if (listenInBackground) startListenService()
+    }
+
+    fun setListen(on: Boolean) {
+        listenInBackground = on
+        prefs.edit().putBoolean("listen", on).apply()
+        if (on) startListenService() else try { ListenService.stop(app) } catch (_: Exception) {}
+    }
+
+    private fun startListenService() {
+        try { ListenService.start(app) } catch (e: Exception) { log("Serviço de escuta não arrancou: ${e.message}") }
+    }
+
+    fun setPassword(pw: String) {
+        prefs.edit().putString("pw", pw.trim()).apply()
+        try { Secure.setPassword(pw.trim()) } catch (e: Exception) { log("Chave não iniciada: ${e.message}") }
+        log(if (pw.isBlank()) "Senha padrão ativa" else "Senha das chamadas atualizada")
     }
 
     fun startBluetooth() { bt.startServer() }
@@ -94,8 +127,63 @@ class CallEngine(private val app: Context) : TransportListener {
         if (!started) return
         started = false
         p2p.stop(); lan.stop(); bt.stop()
+        try { ListenService.stop(app) } catch (_: Exception) {}
         log("Motor parado")
     }
+
+    fun setMode(m: String?) {
+        mode = m
+        prefs.edit().apply { if (m == null) remove("mode") else putString("mode", m) }.apply()
+        lan.wake()
+    }
+
+    // ---------------------------------------------------------------- clientes bloqueados e servidor escolhido
+
+    private val blocked: MutableSet<String> = HashSet(prefs.getStringSet("blocked", emptySet()) ?: emptySet())
+
+    fun isBlocked(id: String) = blocked.contains(id)
+
+    fun clearBlocked() {
+        blocked.clear()
+        prefs.edit().remove("blocked").apply()
+        ui?.onPeersChanged()
+    }
+
+    fun selectedServerPeer(): Peer? = serverId?.let { id -> allPeers().firstOrNull { it.id == id } }
+
+    fun setBlocked(id: String, on: Boolean) {
+        if (on) blocked.add(id) else blocked.remove(id)
+        prefs.edit().putStringSet("blocked", HashSet(blocked)).apply()
+        log(if (on) "Bloqueado: $id" else "Desbloqueado: $id")
+        ui?.onPeersChanged()
+    }
+
+    var serverId: String? = prefs.getString("server_id", null)
+        private set
+
+    fun selectServer(id: String?) {
+        serverId = id
+        prefs.edit().apply { if (id == null) remove("server_id") else putString("server_id", id) }.apply()
+        ui?.onPeersChanged()
+    }
+
+    var defaultSpeaker: Boolean = prefs.getBoolean("default_speaker", false)
+        private set
+
+    fun setDefaultSpeaker(on: Boolean) {
+        defaultSpeaker = on
+        prefs.edit().putBoolean("default_speaker", on).apply()
+    }
+
+    // ---------------------------------------------------------------- histórico
+
+    class CallRecord(val peerName: String, val incoming: Boolean, val at: Long, val seconds: Int, val result: String)
+
+    private val historyList = ArrayList<CallRecord>()
+    val history: List<CallRecord> get() = historyList.toList()
+    private var incomingCall = false
+
+    fun clearLog() { synchronized(logLines) { logLines.clear() }; ui?.onLog() }
 
     fun setName(n: String) {
         displayName = n.trim().ifBlank { "Utilizador" }
@@ -105,7 +193,7 @@ class CallEngine(private val app: Context) : TransportListener {
 
     fun transportFor(peerId: String): Transport = if (peerId.startsWith("bt:")) bt else lan
 
-    fun allPeers(): List<Peer> = lan.peers() + bt.peers()
+    fun allPeers(): List<Peer> = (lan.peers() + bt.peers()).map { it.copy(blocked = blocked.contains(it.id)) }
 
     // ---------------------------------------------------------------- diagnóstico
 
@@ -125,7 +213,7 @@ class CallEngine(private val app: Context) : TransportListener {
     fun startCall(p: Peer) {
         if (state != State.IDLE) { ui?.onToast("Já estás numa chamada"); return }
         val id = newCallId()
-        state = State.OUTGOING; peer = p; callId = id; ringing = false
+        state = State.OUTGOING; peer = p; callId = id; ringing = false; incomingCall = false
         statusText = "A ligar a ${p.name}..."
         outgoingStart = SystemClock.elapsedRealtime()
         log("Chamada $id para ${p.name} (${p.id}) via ${p.via.ifBlank { "bluetooth" }}")
@@ -176,12 +264,24 @@ class CallEngine(private val app: Context) : TransportListener {
 
     override fun onLog(msg: String) { log(msg) }
 
-    override fun onControl(peerId: String, text: String) { main.post { handleControl(peerId, text) } }
+    override fun onControl(peerId: String, text: String) {
+        val plain = Secure.decryptText(text)
+        if (plain == null) {
+            val now = SystemClock.elapsedRealtime()
+            if (now - lastDecryptLog > 10_000) {
+                lastDecryptLog = now
+                log("Mensagem recebida mas não decifrada. A senha é igual nos dois telemóveis?")
+            }
+            return
+        }
+        main.post { handleControl(peerId, plain) }
+    }
 
     override fun onAudio(peerId: String, seq: Int, pcm: ByteArray) {
         if (state == State.ACTIVE && peerId == peer?.id) {
+            val plain = Secure.decrypt(pcm) ?: return
             lastRemote = SystemClock.elapsedRealtime()
-            audio?.onRemoteFrame(seq, pcm)
+            audio?.onRemoteFrame(seq, Codec.decode(plain))
         }
     }
 
@@ -203,15 +303,17 @@ class CallEngine(private val app: Context) : TransportListener {
         when (cmd) {
             "CALL" -> {
                 val name = parts.getOrNull(2)?.replace('_', ' ') ?: "Desconhecido"
+                if (blocked.contains(peerId)) { log("Chamada de $peerId ignorada (bloqueado)"); return }
                 val p = allPeers().firstOrNull { it.id == peerId }
                     ?: Peer(peerId, name, if (peerId.startsWith("bt:")) PeerKind.BLUETOOTH else PeerKind.LAN)
                 if (state == State.IDLE) {
-                    state = State.INCOMING; peer = p; callId = cid
+                    state = State.INCOMING; peer = p; callId = cid; incomingCall = true
                     statusText = "Chamada de ${p.name}"
                     lastCallSeen = SystemClock.elapsedRealtime()
                     log("Chamada recebida de ${p.name}")
                     send(p, "RINGING|$cid")
                     startRinging()
+                    if (ui == null) showIncomingNotification(p)
                     main.removeCallbacks(incomingWatch)
                     main.postDelayed(incomingWatch, 1000)
                     ui?.onStateChanged()
@@ -236,7 +338,9 @@ class CallEngine(private val app: Context) : TransportListener {
         }
     }
 
-    private fun send(p: Peer, text: String) { transportFor(p.id).sendControl(p.id, text) }
+    private fun send(p: Peer, text: String) {
+        try { transportFor(p.id).sendControl(p.id, Secure.encryptText(text)) } catch (e: Exception) { log("Envio cifrado falhou: ${e.message}") }
+    }
 
     private val callTick = object : Runnable {
         override fun run() {
@@ -271,10 +375,12 @@ class CallEngine(private val app: Context) : TransportListener {
         main.removeCallbacks(callTick)
         main.removeCallbacks(incomingWatch)
         stopRinging()
+        hideIncomingNotification()
         state = State.ACTIVE
         activeSince = SystemClock.elapsedRealtime()
         lastRemote = activeSince
         statusText = "Em chamada com ${p.name}"
+        speaker = defaultSpeaker
         log("Chamada ativa com ${p.name}")
         try { CallService.start(app, "Em chamada com ${p.name}") } catch (e: Exception) { log("Serviço de chamada não arrancou: ${e.message}") }
         acquireLocks()
@@ -282,7 +388,9 @@ class CallEngine(private val app: Context) : TransportListener {
         seq = 0
         val a = AudioEngine(app, t.audioRate) { buf, n ->
             seq = (seq + 1) and 0xFFFF
-            t.sendAudio(p.id, seq, buf, n)
+            val packed = Codec.encode(buf, n)
+            val sealed = Secure.encrypt(packed, packed.size)
+            t.sendAudio(p.id, seq, sealed, sealed.size)
         }
         a.muted = muted
         val err = a.start()
@@ -305,9 +413,15 @@ class CallEngine(private val app: Context) : TransportListener {
         main.removeCallbacks(incomingWatch)
         main.removeCallbacks(keepAlive)
         stopRinging()
+        hideIncomingNotification()
         audio?.stop(); audio = null
         releaseLocks()
         try { CallService.stop(app) } catch (_: Exception) {}
+        if (p != null) {
+            val secs = if (state == State.ACTIVE) ((SystemClock.elapsedRealtime() - activeSince) / 1000).toInt() else 0
+            historyList.add(0, CallRecord(p.name, incomingCall, System.currentTimeMillis(), secs, message))
+            while (historyList.size > 50) historyList.removeAt(historyList.size - 1)
+        }
         log("Chamada terminada: $message")
         state = State.IDLE; peer = null; callId = ""; ringing = false
         muted = false; speaker = false
@@ -328,6 +442,35 @@ class CallEngine(private val app: Context) : TransportListener {
             val v = app.getSystemService(Context.VIBRATOR_SERVICE) as? Vibrator
             v?.vibrate(VibrationEffect.createWaveform(longArrayOf(0, 600, 800), 0))
         } catch (_: Exception) {}
+    }
+
+    private fun showIncomingNotification(p: Peer) {
+        try {
+            val nm = app.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+            nm.createNotificationChannel(
+                NotificationChannel("vozlivre_incoming", "Chamadas recebidas", NotificationManager.IMPORTANCE_HIGH).apply {
+                    setSound(null, null); enableVibration(false)
+                }
+            )
+            val pi = PendingIntent.getActivity(
+                app, 1, Intent(app, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP),
+                PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+            )
+            val n = Notification.Builder(app, "vozlivre_incoming")
+                .setSmallIcon(android.R.drawable.sym_call_incoming)
+                .setContentTitle("Chamada de ${p.name}")
+                .setContentText("Toca para atender")
+                .setCategory(Notification.CATEGORY_CALL)
+                .setFullScreenIntent(pi, true)
+                .setContentIntent(pi)
+                .setOngoing(true)
+                .build()
+            nm.notify(2, n)
+        } catch (e: Exception) { log("Notificação de chamada falhou: ${e.message}") }
+    }
+
+    private fun hideIncomingNotification() {
+        try { (app.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager).cancel(2) } catch (_: Exception) {}
     }
 
     private fun stopRinging() {

@@ -11,7 +11,9 @@ data class Peer(
     val name: String,
     val kind: PeerKind,
     val via: String = "",
-    val detail: String = ""
+    val detail: String = "",
+    val role: String = "",
+    val blocked: Boolean = false
 ) {
     val isP2p: Boolean get() = via.startsWith("p2p")
 }
