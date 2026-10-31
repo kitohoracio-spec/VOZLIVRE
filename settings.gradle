@@ -6,4 +6,4 @@ dependencyResolutionManagement {
     repositories { google(); mavenCentral() }
 }
 rootProject.name = "VozLivre"
-include(":app")
+include(":core", ":app-server", ":app-client")

@@ -1,4 +1,4 @@
-name: Build VozLivre APK
+name: Build VozLivre APKs
 on:
   workflow_dispatch:
   push:
@@ -20,10 +20,15 @@ jobs:
         uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '8.10.2'
-      - name: Build debug APK
-        run: gradle assembleDebug
-      - name: Upload APK
+      - name: Build Servidor e Cliente (debug)
+        run: gradle assembleServerDebug assembleClientDebug
+      - name: Upload APK Servidor
         uses: actions/upload-artifact@v4
         with:
-          name: VozLivre-debug-apk
-          path: app/build/outputs/apk/debug/app-debug.apk
+          name: VozLivre-Servidor-debug
+          path: app-server/build/outputs/apk/debug/VozLivre-Servidor-debug.apk
+      - name: Upload APK Cliente
+        uses: actions/upload-artifact@v4
+        with:
+          name: VozLivre-Cliente-debug
+          path: app-client/build/outputs/apk/debug/VozLivre-Cliente-debug.apk
