@@ -2,7 +2,10 @@ package com.vozlivre.app
 
 import android.content.Context
 import android.content.res.ColorStateList
+import android.graphics.Canvas
 import android.graphics.Color
+import android.graphics.Paint
+import android.graphics.Path
 import android.graphics.Typeface
 import android.graphics.drawable.Drawable
 import android.graphics.drawable.GradientDrawable
@@ -13,6 +16,7 @@ import android.view.Gravity
 import android.view.View
 import android.widget.Button
 import android.widget.EditText
+import android.widget.FrameLayout
 import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.Switch
@@ -24,10 +28,10 @@ object Brand {
 
 object Colors {
     val BG = 0xFF000000.toInt()
-    val SURFACE = 0xFF070D09.toInt()
-    val CARD = 0xFF0C1510.toInt()
-    val CARD_HI = 0xFF12201A.toInt()
-    val STROKE = 0xFF1B3626.toInt()
+    val SURFACE = 0xFF06110B.toInt()
+    val CARD = 0xFF0A1811.toInt()
+    val CARD_HI = 0xFF0F241A.toInt()
+    val STROKE = 0xFF18553A.toInt()
     val GREEN = 0xFF00E676.toInt()
     val GREEN_DIM = 0xFF0B6B3A.toInt()
     val TEXT = 0xFFE9F6EE.toInt()
@@ -54,13 +58,20 @@ interface Host {
     fun goTo(index: Int)
     fun getVolume(): Int
     fun setVolume(pct: Int)
+    fun registerLog(s: LogSection)
+    fun openSub(title: String, icon: Int, sections: List<Section>)
 }
 
 /** Um bloco de interface com atualização própria. */
 abstract class Section {
     abstract val view: View
     open fun refresh() {}
+    /** Secções "vivas" são atualizadas a cada segundo (temporizadores). */
+    open val live: Boolean get() = false
 }
+
+/** Envolve uma vista simples como secção. */
+class StaticSection(override val view: View) : Section()
 
 /** Fábrica de componentes no estilo escuro com verde elétrico. */
 class Kit(val ctx: Context) {
@@ -250,10 +261,143 @@ class Kit(val ctx: Context) {
 
     fun kv(key: String, value: String, color: Int = Colors.TEXT): LinearLayout = kv(key, text(value, 13f, color, true))
 
+    fun iconCircle(iconRes: Int, sizeDp: Int = 40, color: Int = Colors.GREEN): FrameLayout {
+        val f = FrameLayout(ctx)
+        f.background = shape(Colors.alpha(color, 0x1F), sizeDp, Colors.alpha(color, 0x88), 1)
+        val i = ImageView(ctx)
+        i.setImageResource(iconRes)
+        i.setColorFilter(color)
+        f.addView(i, FrameLayout.LayoutParams(dp(sizeDp * 5 / 9), dp(sizeDp * 5 / 9), Gravity.CENTER))
+        f.layoutParams = LinearLayout.LayoutParams(dp(sizeDp), dp(sizeDp))
+        return f
+    }
+
+    fun deviceTile(sizeDp: Int = 42, color: Int = Colors.GREEN, iconRes: Int = R.drawable.ic_device): FrameLayout {
+        val f = FrameLayout(ctx)
+        f.background = shape(Colors.alpha(color, 0x1F), 12, Colors.alpha(color, 0x66), 1)
+        val i = ImageView(ctx)
+        i.setImageResource(iconRes)
+        i.setColorFilter(color)
+        f.addView(i, FrameLayout.LayoutParams(dp(sizeDp * 5 / 9), dp(sizeDp * 5 / 9), Gravity.CENTER))
+        f.layoutParams = LinearLayout.LayoutParams(dp(sizeDp), dp(sizeDp))
+        return f
+    }
+
+    /** Cabeçalho de ecrã: ícone e título, com seta de voltar opcional. */
+    fun titleHeader(iconRes: Int, title: String, onBack: (() -> Unit)? = null): LinearLayout {
+        val r = LinearLayout(ctx)
+        r.orientation = LinearLayout.HORIZONTAL
+        r.gravity = Gravity.CENTER_VERTICAL
+        if (onBack != null) {
+            val back = icon(R.drawable.ic_chevron, Colors.GREEN, 26)
+            back.rotation = 180f
+            back.setPadding(dp(2), dp(2), dp(2), dp(2))
+            back.setOnClickListener { onBack() }
+            r.addView(back)
+        }
+        r.addView(icon(iconRes, Colors.GREEN, 26), lp(dp(26), dp(26), left = if (onBack != null) 8 else 0))
+        r.addView(text(title, 22f, Colors.TEXT, true), lp(0, -2, left = 10, weight = 1f))
+        return r
+    }
+
+    fun segmented(labels: List<String>, selected: Int, onSelect: (Int) -> Unit): LinearLayout {
+        val c = LinearLayout(ctx)
+        c.orientation = LinearLayout.HORIZONTAL
+        c.background = shape(Colors.SURFACE, 12, Colors.STROKE, 1)
+        c.setPadding(dp(3), dp(3), dp(3), dp(3))
+        for ((i, label) in labels.withIndex()) {
+            val t = text(label, 13f, if (i == selected) Colors.GREEN else Colors.TEXT, i == selected)
+            t.gravity = Gravity.CENTER
+            t.setPadding(dp(6), dp(8), dp(6), dp(8))
+            if (i == selected) t.background = shape(Colors.alpha(Colors.GREEN, 0x26), 10, Colors.alpha(Colors.GREEN, 0x99), 1)
+            t.setOnClickListener { onSelect(i) }
+            c.addView(t, lp(0, -2, left = if (i > 0) 4 else 0, weight = 1f))
+        }
+        return c
+    }
+
+    /** Linha de lista com ícone, título, subtítulo e seta. */
+    fun navRow(iconRes: Int, title: String, sub: String, onClick: () -> Unit): LinearLayout {
+        val r = LinearLayout(ctx)
+        r.orientation = LinearLayout.HORIZONTAL
+        r.gravity = Gravity.CENTER_VERTICAL
+        r.background = shape(Colors.CARD, 14, Colors.STROKE, 1)
+        r.setPadding(dp(12), dp(10), dp(12), dp(10))
+        r.addView(iconCircle(iconRes, 40))
+        val col = LinearLayout(ctx)
+        col.orientation = LinearLayout.VERTICAL
+        col.addView(text(title, 15f, Colors.TEXT, true))
+        if (sub.isNotEmpty()) col.addView(muted(sub, 12f))
+        r.addView(col, lp(0, -2, left = 12, weight = 1f))
+        r.addView(icon(R.drawable.ic_chevron, Colors.MUTED, 18))
+        r.isClickable = true
+        r.setOnClickListener { onClick() }
+        return r
+    }
+
+    /** Linha informativa: ícone, rótulo pequeno e valor. */
+    fun infoRow(iconRes: Int, label: String, value: TextView): LinearLayout {
+        val r = LinearLayout(ctx)
+        r.orientation = LinearLayout.HORIZONTAL
+        r.gravity = Gravity.CENTER_VERTICAL
+        r.background = shape(Colors.CARD, 14, Colors.STROKE, 1)
+        r.setPadding(dp(12), dp(10), dp(12), dp(10))
+        r.addView(iconCircle(iconRes, 40))
+        val col = LinearLayout(ctx)
+        col.orientation = LinearLayout.VERTICAL
+        col.addView(muted(label, 12f))
+        value.textSize = 15f
+        col.addView(value)
+        r.addView(col, lp(0, -2, left = 12, weight = 1f))
+        return r
+    }
+
+    fun statTile(iconRes: Int, label: String, value: TextView): LinearLayout {
+        val t = LinearLayout(ctx)
+        t.orientation = LinearLayout.VERTICAL
+        t.background = shape(Colors.CARD, 16, Colors.STROKE, 1)
+        t.setPadding(dp(14), dp(14), dp(14), dp(14))
+        t.addView(iconCircle(iconRes, 38))
+        t.addView(muted(label, 12f), lp(top = 10))
+        value.textSize = 20f
+        t.addView(value, lp(top = 2))
+        return t
+    }
+
     fun divider(): View {
         val v = View(ctx)
         v.setBackgroundColor(Colors.STROKE)
         v.layoutParams = LinearLayout.LayoutParams(-1, 1)
         return v
+    }
+}
+
+/** Ondas verdes discretas atrás do logótipo. */
+class WaveView(ctx: Context) : View(ctx) {
+    private val paint = Paint(Paint.ANTI_ALIAS_FLAG)
+
+    init {
+        paint.style = Paint.Style.STROKE
+        paint.strokeWidth = 2f * ctx.resources.displayMetrics.density
+    }
+
+    override fun onDraw(c: Canvas) {
+        super.onDraw(c)
+        val w = width.toFloat()
+        val h = height.toFloat()
+        if (w <= 0f || h <= 0f) return
+        for (n in 0 until 3) {
+            paint.color = Colors.alpha(Colors.GREEN, 0x55 - n * 0x16)
+            val path = Path()
+            path.moveTo(0f, h * 0.6f)
+            var x = 0f
+            while (x <= w) {
+                val phase = (x / w) * 6.2832f * (1.1f + n * 0.35f) + n * 1.3f
+                val y = h * 0.6f + kotlin.math.sin(phase) * h * (0.22f - n * 0.04f)
+                path.lineTo(x, y)
+                x += 6f
+            }
+            c.drawPath(path, paint)
+        }
     }
 }

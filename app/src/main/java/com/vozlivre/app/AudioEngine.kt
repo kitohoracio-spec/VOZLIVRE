@@ -38,6 +38,7 @@ class AudioEngine(
     private var lastSeq = -1
     @Volatile private var running = false
     @Volatile var muted = false
+    @Volatile var gain = 1f
 
     /** Devolve uma mensagem de erro, ou null se arrancou bem. */
     fun start(): String? {
@@ -96,6 +97,8 @@ class AudioEngine(
                         off += n
                     }
                     if (running && off == frameBytes && !muted) {
+                        val g = gain
+                        if (g != 1f) applyGain(buf, frameBytes, g)
                         try { sink(buf, frameBytes) } catch (_: Exception) {}
                     }
                 }
@@ -111,6 +114,19 @@ class AudioEngine(
         } catch (e: Exception) {
             stop()
             return "Erro de áudio: ${e.message}"
+        }
+    }
+
+    private fun applyGain(buf: ByteArray, len: Int, g: Float) {
+        var i = 0
+        while (i + 1 < len) {
+            val s = (buf[i].toInt() and 0xFF) or (buf[i + 1].toInt() shl 8)
+            var v = (s * g).toInt()
+            if (v > 32767) v = 32767
+            if (v < -32768) v = -32768
+            buf[i] = (v and 0xFF).toByte()
+            buf[i + 1] = ((v shr 8) and 0xFF).toByte()
+            i += 2
         }
     }
 

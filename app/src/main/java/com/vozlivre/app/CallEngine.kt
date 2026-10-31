@@ -101,6 +101,7 @@ class CallEngine(private val app: Context) : TransportListener {
         started = true
         lan.start()
         p2p.start()
+        sessionStart = SystemClock.elapsedRealtime()
         log("Motor iniciado. O meu id: $myId")
         if (listenInBackground) startListenService()
     }
@@ -177,11 +178,107 @@ class CallEngine(private val app: Context) : TransportListener {
 
     // ---------------------------------------------------------------- histórico
 
-    class CallRecord(val peerName: String, val incoming: Boolean, val at: Long, val seconds: Int, val result: String)
+    class CallRecord(val peerId: String, val peerName: String, val incoming: Boolean, val at: Long, val seconds: Int, val result: String)
 
     private val historyList = ArrayList<CallRecord>()
     val history: List<CallRecord> get() = historyList.toList()
     private var incomingCall = false
+
+    // ---------------------------------------------------------------- aprovação de clientes, favoritos e medições
+
+    private val approved: MutableSet<String> = HashSet(prefs.getStringSet("approved", emptySet()) ?: emptySet())
+
+    var approvalRequired: Boolean = prefs.getBoolean("approval", false)
+        private set
+
+    fun setApprovalRequired(on: Boolean) {
+        approvalRequired = on
+        prefs.edit().putBoolean("approval", on).apply()
+        ui?.onPeersChanged()
+    }
+
+    fun approve(id: String) {
+        approved.add(id)
+        prefs.edit().putStringSet("approved", HashSet(approved)).apply()
+        ui?.onPeersChanged()
+    }
+
+    fun clearApprovals() {
+        approved.clear()
+        prefs.edit().remove("approved").apply()
+        ui?.onPeersChanged()
+    }
+
+    fun isApproved(id: String) = approved.contains(id)
+
+    fun isPending(p: Peer): Boolean =
+        mode == "server" && approvalRequired && !approved.contains(p.id) && !blocked.contains(p.id)
+
+    /** Pares que não são servidores (clientes e dispositivos Bluetooth). */
+    fun clients(): List<Peer> = allPeers().filter { it.role != "S" }
+
+    private val favorites: MutableMap<String, String> = HashMap()
+
+    init {
+        for (e in prefs.getStringSet("favorites", emptySet()) ?: emptySet()) {
+            val i = e.indexOf('\t')
+            if (i > 0) favorites[e.substring(0, i)] = e.substring(i + 1)
+        }
+    }
+
+    fun favoriteList(): List<Pair<String, String>> = favorites.entries.map { it.key to it.value }.sortedBy { it.second }
+
+    fun isFavorite(id: String) = favorites.containsKey(id)
+
+    fun toggleFavorite(id: String, name: String) {
+        if (favorites.remove(id) == null) favorites[id] = name
+        prefs.edit().putStringSet("favorites", HashSet(favorites.entries.map { it.key + "\t" + it.value })).apply()
+        ui?.onPeersChanged()
+    }
+
+    var micPercent: Int = prefs.getInt("mic_pct", 50)
+        private set
+
+    fun setMicPercent(p: Int) {
+        micPercent = p
+        prefs.edit().putInt("mic_pct", p).apply()
+        audio?.gain = p / 50f
+    }
+
+    private var sessionStart = SystemClock.elapsedRealtime()
+    private var serverSeenSince = 0L
+
+    fun sessionSeconds(): Int = ((SystemClock.elapsedRealtime() - sessionStart) / 1000).toInt()
+
+    /** Segundos desde que o servidor escolhido ficou visível, ou -1 se não está visível. */
+    fun serverLinkSeconds(): Int {
+        if (selectedServerPeer() == null) { serverSeenSince = 0L; return -1 }
+        val now = SystemClock.elapsedRealtime()
+        if (serverSeenSince == 0L) serverSeenSince = now
+        return ((now - serverSeenSince) / 1000).toInt()
+    }
+
+    fun wifiSignal(): String {
+        return try {
+            val wm = app.applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
+            @Suppress("DEPRECATION")
+            val rssi = wm.connectionInfo.rssi
+            when {
+                rssi <= -127 || rssi == 0 -> "Indisponível"
+                rssi >= -55 -> "Excelente"
+                rssi >= -67 -> "Boa"
+                rssi >= -80 -> "Razoável"
+                else -> "Fraca"
+            }
+        } catch (e: Exception) { "Indisponível" }
+    }
+
+    fun networkLabel(): String = when {
+        lan.hasP2pLink() -> "Wi-Fi Direct"
+        lan.hasLinks() -> "Wi-Fi"
+        bt.isEnabled() -> "Bluetooth"
+        else -> "Sem rede"
+    }
 
     fun clearLog() { synchronized(logLines) { logLines.clear() }; ui?.onLog() }
 
@@ -304,6 +401,11 @@ class CallEngine(private val app: Context) : TransportListener {
             "CALL" -> {
                 val name = parts.getOrNull(2)?.replace('_', ' ') ?: "Desconhecido"
                 if (blocked.contains(peerId)) { log("Chamada de $peerId ignorada (bloqueado)"); return }
+                if (mode == "server" && approvalRequired && !approved.contains(peerId)) {
+                    log("Chamada de $peerId recusada: cliente ainda não aprovado")
+                    allPeers().firstOrNull { it.id == peerId }?.let { send(it, "BUSY|$cid") }
+                    return
+                }
                 val p = allPeers().firstOrNull { it.id == peerId }
                     ?: Peer(peerId, name, if (peerId.startsWith("bt:")) PeerKind.BLUETOOTH else PeerKind.LAN)
                 if (state == State.IDLE) {
@@ -393,6 +495,7 @@ class CallEngine(private val app: Context) : TransportListener {
             t.sendAudio(p.id, seq, sealed, sealed.size)
         }
         a.muted = muted
+        a.gain = micPercent / 50f
         val err = a.start()
         if (err != null) { log(err); ui?.onToast(err); finish(err, true); return }
         a.setSpeaker(speaker)
@@ -419,7 +522,7 @@ class CallEngine(private val app: Context) : TransportListener {
         try { CallService.stop(app) } catch (_: Exception) {}
         if (p != null) {
             val secs = if (state == State.ACTIVE) ((SystemClock.elapsedRealtime() - activeSince) / 1000).toInt() else 0
-            historyList.add(0, CallRecord(p.name, incomingCall, System.currentTimeMillis(), secs, message))
+            historyList.add(0, CallRecord(p.id, p.name, incomingCall, System.currentTimeMillis(), secs, message))
             while (historyList.size > 50) historyList.removeAt(historyList.size - 1)
         }
         log("Chamada terminada: $message")

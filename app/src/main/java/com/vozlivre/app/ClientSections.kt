@@ -1,5 +1,7 @@
 package com.vozlivre.app
 
+import android.app.AlertDialog
+import android.content.res.ColorStateList
 import android.graphics.Color
 import android.view.Gravity
 import android.view.View
@@ -7,48 +9,48 @@ import android.widget.FrameLayout
 import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.SeekBar
-import android.widget.Switch
 import android.widget.TextView
-import android.content.res.ColorStateList
 
-/** Estado da ligação ao servidor escolhido. */
-class ClientLinkStatusSection(private val k: Kit, private val engine: CallEngine, private val host: Host) : Section() {
+/** Cartão "Ligado ao servidor" com botão Desligar. */
+class ClientConnectionSection(private val k: Kit, private val engine: CallEngine, private val host: Host) : Section() {
     private val card = k.card(true)
-    private val dot = k.dot(Colors.AMBER)
-    private val title = k.text("", 18f, Colors.TEXT, true)
-    private val sub = k.muted("")
-    private val scan = k.button("Procurar servidores", Kit.Style.PRIMARY) { host.scanAll() }
+    private val content = LinearLayout(k.ctx)
     override val view: View get() = card
 
     init {
-        val top = LinearLayout(k.ctx)
-        top.orientation = LinearLayout.HORIZONTAL
-        top.gravity = Gravity.CENTER_VERTICAL
-        top.addView(dot)
-        top.addView(title, k.lp(0, -2, left = 10, weight = 1f))
-        card.addView(top)
-        card.addView(sub, k.lp(top = 6))
-        card.addView(scan, k.lp(top = 12))
+        content.orientation = LinearLayout.VERTICAL
+        card.addView(content)
     }
 
     override fun refresh() {
+        content.removeAllViews()
         val s = engine.selectedServerPeer()
-        when {
-            s != null -> {
-                k.recolorDot(dot, Colors.GREEN)
-                title.text = "Ligado a ${s.name}"
-                sub.text = "${viaLabel(s)}${if (s.detail.isNotEmpty()) " · " + s.detail else ""}"
-            }
-            engine.serverId != null -> {
-                k.recolorDot(dot, Colors.AMBER)
-                title.text = "Servidor fora de alcance"
-                sub.text = "O servidor escolhido não está visível. Procura de novo."
-            }
-            else -> {
-                k.recolorDot(dot, Colors.MUTED)
-                title.text = "Sem servidor escolhido"
-                sub.text = "Procura e escolhe um servidor na lista abaixo."
-            }
+        if (s != null) {
+            content.addView(k.text("Ligado ao servidor", 18f, Colors.TEXT, true))
+            val row = LinearLayout(k.ctx)
+            row.orientation = LinearLayout.HORIZONTAL
+            row.gravity = Gravity.CENTER_VERTICAL
+            row.addView(k.deviceTile(46, Colors.GREEN, R.drawable.ic_person))
+            val col = LinearLayout(k.ctx)
+            col.orientation = LinearLayout.VERTICAL
+            col.addView(k.text(s.name, 16f, Colors.TEXT, true))
+            val ipRow = LinearLayout(k.ctx)
+            ipRow.orientation = LinearLayout.HORIZONTAL
+            ipRow.gravity = Gravity.CENTER_VERTICAL
+            ipRow.addView(k.icon(R.drawable.ic_wifi, Colors.GREEN, 14))
+            ipRow.addView(k.muted(if (s.detail.isNotEmpty()) s.detail else viaLabel(s), 13f), k.lp(-2, -2, left = 6))
+            col.addView(ipRow, k.lp(top = 2))
+            row.addView(col, k.lp(0, -2, left = 12, weight = 1f))
+            content.addView(row, k.lp(top = 12))
+            content.addView(k.button("Desligar") { engine.selectServer(null); host.toast("Desligado do servidor") }, k.lp(top = 14))
+        } else if (engine.serverId != null) {
+            content.addView(k.text("Servidor fora de alcance", 18f, Colors.AMBER, true))
+            content.addView(k.muted("O servidor escolhido não está visível. Procura de novo."), k.lp(top = 6))
+            content.addView(k.button("Procurar servidores") { host.scanAll() }, k.lp(top = 14))
+        } else {
+            content.addView(k.text("Sem servidor escolhido", 18f, Colors.TEXT, true))
+            content.addView(k.muted("Procura e escolhe um servidor na lista abaixo."), k.lp(top = 6))
+            content.addView(k.button("Procurar servidores") { host.scanAll() }, k.lp(top = 14))
         }
     }
 }
@@ -78,10 +80,9 @@ class ServerListSection(private val k: Kit, private val engine: CallEngine, priv
         }
         for (p in servers) {
             val chosen = engine.serverId == p.id
-            val b = if (chosen) k.pill("Escolhido") else k.button("Ligar", Kit.Style.PRIMARY, true) {
+            val b: View = if (chosen) k.pill("Escolhido") else k.button("Ligar", Kit.Style.PRIMARY, true) {
                 engine.selectServer(p.id)
                 host.toast("Servidor: ${p.name}")
-                host.goTo(1)
             }
             list.addView(k.peerRow(p, b), k.lp(bottom = 8))
         }
@@ -118,146 +119,215 @@ class OtherMethodsSection(private val k: Kit, private val engine: CallEngine, pr
     }
 }
 
-/** Cartão grande para ligar ao servidor. */
-class CallServerSection(private val k: Kit, private val engine: CallEngine, private val host: Host) : Section() {
-    private val card = k.card(true)
-    private val holder = LinearLayout(k.ctx)
-    override val view: View get() = card
+/** Separador Chamadas do cliente: Recentes e Favoritos, com botão Nova chamada. */
+class ClientCallsSection(private val k: Kit, private val engine: CallEngine, private val host: Host) : Section() {
+    private val root = LinearLayout(k.ctx)
+    private val segHolder = FrameLayout(k.ctx)
+    private val list = LinearLayout(k.ctx)
+    private var tab = 0
+    override val view: View get() = root
 
     init {
-        holder.orientation = LinearLayout.VERTICAL
-        holder.gravity = Gravity.CENTER_HORIZONTAL
-        card.addView(holder)
+        root.orientation = LinearLayout.VERTICAL
+        list.orientation = LinearLayout.VERTICAL
+        root.addView(segHolder)
+        root.addView(list, k.lp(top = 12))
+        root.addView(k.button("Nova chamada") { newCall() }, k.lp(top = 8))
     }
 
-    override fun refresh() {
-        holder.removeAllViews()
+    private fun newCall() {
         val s = engine.selectedServerPeer()
         if (s == null) {
-            holder.addView(k.muted("Escolhe primeiro um servidor no separador Ligação."), k.lp(top = 8, bottom = 8))
-            holder.addView(k.button("Ir para Ligação", Kit.Style.SECONDARY) { host.goTo(0) })
-            return
+            host.toast("Escolhe primeiro um servidor")
+            host.goTo(0)
+        } else {
+            host.withPerms(host.micPerms()) { engine.startCall(s) }
         }
-        holder.addView(k.avatar(s.name, 88), k.lp(-2, -2, top = 8))
-        holder.addView(k.text(s.name, 22f, Colors.TEXT, true), k.lp(-2, -2, top = 12))
-        holder.addView(k.muted("${viaLabel(s)}${if (s.detail.isNotEmpty()) " · " + s.detail else ""}"), k.lp(-2, -2, top = 2))
-        val busy = engine.state != CallEngine.State.IDLE
-        val call = FrameLayout(k.ctx)
-        call.background = k.shape(Colors.GREEN, 40)
-        call.setOnClickListener { if (!busy) host.withPerms(host.micPerms()) { engine.startCall(s) } }
-        call.alpha = if (busy) 0.4f else 1f
-        k.glow(call, Colors.GREEN, 10)
-        val ic = ImageView(k.ctx)
-        ic.setImageResource(R.drawable.ic_call)
-        ic.setColorFilter(Color.BLACK)
-        call.addView(ic, FrameLayout.LayoutParams(k.dp(34), k.dp(34), Gravity.CENTER))
-        holder.addView(call, k.lp(k.dp(80), k.dp(80), top = 20))
-        holder.addView(k.muted("Ligar ao servidor", 13f), k.lp(-2, -2, top = 8, bottom = 4))
-    }
-}
-
-/** Mosaicos de microfone e altifalante, volume e preferências. */
-class AudioControlsSection(private val k: Kit, private val engine: CallEngine, private val host: Host) : Section() {
-    private val card = k.card()
-    private val tiles = LinearLayout(k.ctx)
-    private val note = k.muted("", 12f)
-    private val seek = SeekBar(k.ctx)
-    private val pref = k.switchRow("Altifalante por defeito", "Usa o altifalante ao atender ou ligar.", engine.defaultSpeaker) { v -> engine.setDefaultSpeaker(v) }
-    override val view: View get() = card
-
-    init {
-        card.addView(k.sectionTitle(R.drawable.ic_speaker, "Controlo de áudio"))
-        tiles.orientation = LinearLayout.HORIZONTAL
-        card.addView(tiles, k.lp(top = 12))
-        card.addView(note, k.lp(top = 8))
-        card.addView(k.divider(), k.lp(top = 14, bottom = 14))
-        card.addView(k.text("Volume da chamada", 14f, Colors.TEXT, true))
-        seek.max = 100
-        seek.progress = host.getVolume()
-        seek.progressTintList = ColorStateList.valueOf(Colors.GREEN)
-        seek.thumbTintList = ColorStateList.valueOf(Colors.GREEN)
-        seek.progressBackgroundTintList = ColorStateList.valueOf(Colors.STROKE)
-        seek.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
-            override fun onProgressChanged(s: SeekBar?, p: Int, fromUser: Boolean) { if (fromUser) host.setVolume(p) }
-            override fun onStartTrackingTouch(s: SeekBar?) {}
-            override fun onStopTrackingTouch(s: SeekBar?) {}
-        })
-        card.addView(seek, k.lp(top = 8))
-        card.addView(k.divider(), k.lp(top = 14, bottom = 14))
-        card.addView(pref)
-        card.addView(k.divider(), k.lp(top = 14, bottom = 14))
-        card.addView(k.kv("Codec", "G.711 µ-law"))
-        card.addView(k.kv("Taxa Wi-Fi / Bluetooth", "16 kHz / 8 kHz"), k.lp(top = 6))
-        card.addView(k.kv("Cifra", "AES-256-GCM"), k.lp(top = 6))
     }
 
-    private fun tile(icon: Int, label: String, active: Boolean, activeColor: Int, enabled: Boolean, onClick: () -> Unit): LinearLayout {
-        val t = LinearLayout(k.ctx)
-        t.orientation = LinearLayout.VERTICAL
-        t.gravity = Gravity.CENTER
-        t.setPadding(k.dp(8), k.dp(16), k.dp(8), k.dp(16))
-        t.background = k.shape(if (active) Colors.alpha(activeColor, 0x22) else Colors.SURFACE, 16, if (active) activeColor else Colors.STROKE, 1)
-        t.addView(k.icon(icon, if (active) activeColor else Colors.TEXT, 30))
-        t.addView(k.text(label, 13f, if (active) activeColor else Colors.TEXT, true), k.lp(-2, -2, top = 8))
-        t.alpha = if (enabled) 1f else 0.45f
-        t.setOnClickListener { if (enabled) onClick() }
-        return t
+    private fun callBack(id: String) {
+        val p = engine.allPeers().firstOrNull { it.id == id }
+        if (p == null) host.toast("Fora de alcance") else host.withPerms(host.micPerms()) { engine.startCall(p) }
     }
 
-    override fun refresh() {
-        tiles.removeAllViews()
-        val live = engine.state == CallEngine.State.ACTIVE
-        tiles.addView(tile(R.drawable.ic_mic, if (engine.muted) "Microfone off" else "Microfone", engine.muted, Colors.RED, live) { engine.toggleMute() }, k.lp(0, -2, weight = 1f))
-        tiles.addView(tile(R.drawable.ic_speaker, "Altifalante", engine.speaker, Colors.GREEN, live) { engine.toggleSpeaker() }, k.lp(0, -2, left = 10, weight = 1f))
-        note.text = if (live) "Chamada em curso." else "Os botões ficam ativos durante uma chamada."
-        val sw = pref.tag as Switch
-        if (sw.isChecked != engine.defaultSpeaker) sw.isChecked = engine.defaultSpeaker
-        if (!seek.isPressed) seek.progress = host.getVolume()
-    }
-}
-
-/** Indicadores de estado do cliente. */
-class ClientIndicatorsSection(private val k: Kit, private val engine: CallEngine, private val host: Host) : Section() {
-    private val card = k.card(true)
-    private val head = k.text("", 18f, Colors.TEXT, true)
-    private val headDot = k.dot(Colors.AMBER)
-    private val list = LinearLayout(k.ctx)
-    override val view: View get() = card
-
-    init {
-        list.orientation = LinearLayout.VERTICAL
-        val top = LinearLayout(k.ctx)
-        top.orientation = LinearLayout.HORIZONTAL
-        top.gravity = Gravity.CENTER_VERTICAL
-        top.addView(headDot)
-        top.addView(head, k.lp(0, -2, left = 10, weight = 1f))
-        card.addView(top)
-        card.addView(list, k.lp(top = 10))
-    }
-
-    private fun item(label: String, ok: Boolean, text: String) {
+    private fun row(id: String, name: String, sub: String): LinearLayout {
         val r = LinearLayout(k.ctx)
         r.orientation = LinearLayout.HORIZONTAL
         r.gravity = Gravity.CENTER_VERTICAL
-        r.addView(k.dot(if (ok) Colors.GREEN else Colors.AMBER, 12))
-        r.addView(k.text(label, 14f), k.lp(0, -2, left = 10, weight = 1f))
-        r.addView(k.muted(text, 12f))
-        list.addView(r, k.lp(top = 10))
+        r.background = k.shape(Colors.CARD, 14, Colors.STROKE, 1)
+        r.setPadding(k.dp(12), k.dp(10), k.dp(12), k.dp(10))
+        r.addView(k.deviceTile(42, Colors.GREEN, R.drawable.ic_person))
+        val col = LinearLayout(k.ctx)
+        col.orientation = LinearLayout.VERTICAL
+        col.addView(k.text(name, 15f, Colors.TEXT, true))
+        col.addView(k.muted(sub, 12f))
+        r.addView(col, k.lp(0, -2, left = 12, weight = 1f))
+        val star = ImageView(k.ctx)
+        star.setImageResource(R.drawable.ic_star)
+        star.setColorFilter(if (engine.isFavorite(id)) Colors.GREEN else Colors.MUTED)
+        star.setPadding(k.dp(6), k.dp(6), k.dp(6), k.dp(6))
+        star.setOnClickListener { engine.toggleFavorite(id, name) }
+        r.addView(star, k.lp(k.dp(36), k.dp(36)))
+        val phone = FrameLayout(k.ctx)
+        phone.background = k.shape(Colors.alpha(Colors.GREEN, 0x1F), 40, Colors.alpha(Colors.GREEN, 0x88), 1)
+        val pi = ImageView(k.ctx)
+        pi.setImageResource(R.drawable.ic_call)
+        pi.setColorFilter(Colors.GREEN)
+        phone.addView(pi, FrameLayout.LayoutParams(k.dp(18), k.dp(18), Gravity.CENTER))
+        phone.setOnClickListener { callBack(id) }
+        r.addView(phone, k.lp(k.dp(40), k.dp(40), left = 6))
+        return r
     }
 
     override fun refresh() {
+        segHolder.removeAllViews()
+        segHolder.addView(k.segmented(listOf("Recentes", "Favoritos"), tab) { tab = it; refresh() })
         list.removeAllViews()
-        val net = engine.lan.hasLinks() || engine.bt.isEnabled()
-        val server = engine.selectedServerPeer() != null
-        val mic = host.allGranted(host.micPerms())
-        val secure = !engine.usingDefaultPassword
-        item("Rede", net, if (net) "ativa" else "sem rede")
-        item("Servidor", server, if (server) "visível" else "ausente")
-        item("Microfone", mic, if (mic) "permitido" else "em falta")
-        item("Senha", secure, if (secure) "personalizada" else "padrão")
-        item("Segundo plano", engine.listenInBackground, if (engine.listenInBackground) "ligado" else "desligado")
-        val ready = net && server && mic
-        k.recolorDot(headDot, if (ready) Colors.GREEN else Colors.AMBER)
-        head.text = if (ready) "Pronto para ligar" else "A aguardar ligação"
+        if (tab == 0) {
+            val items = engine.history.take(20)
+            if (items.isEmpty()) list.addView(k.muted("Ainda não há chamadas nesta sessão."))
+            for (h in items) list.addView(row(h.peerId, h.peerName, formatWhen(h.at)), k.lp(bottom = 8))
+        } else {
+            val favs = engine.favoriteList()
+            if (favs.isEmpty()) list.addView(k.muted("Toca na estrela de uma chamada recente para a guardar aqui."))
+            for ((id, name) in favs) {
+                val visible = engine.allPeers().any { it.id == id }
+                list.addView(row(id, name, if (visible) "Disponível" else "Fora de alcance"), k.lp(bottom = 8))
+            }
+        }
+    }
+}
+
+/** Volume, microfone, saída de áudio e dados de qualidade. */
+class AudioSettingsSection(private val k: Kit, private val engine: CallEngine, private val host: Host) : Section() {
+    private val root = LinearLayout(k.ctx)
+    private val volValue = k.text("", 14f, Colors.TEXT, true)
+    private val micValue = k.text("", 14f, Colors.TEXT, true)
+    private val outValue = k.text("", 14f, Colors.TEXT)
+    private val volSeek = SeekBar(k.ctx)
+    private val micSeek = SeekBar(k.ctx)
+    override val view: View get() = root
+
+    private fun styleSeek(s: SeekBar) {
+        s.max = 100
+        s.progressTintList = ColorStateList.valueOf(Colors.GREEN)
+        s.thumbTintList = ColorStateList.valueOf(Colors.GREEN)
+        s.progressBackgroundTintList = ColorStateList.valueOf(Colors.STROKE)
+    }
+
+    private fun control(icon: Int, label: String, value: TextView, seek: SeekBar): LinearLayout {
+        val c = k.card()
+        val top = LinearLayout(k.ctx)
+        top.orientation = LinearLayout.HORIZONTAL
+        top.gravity = Gravity.CENTER_VERTICAL
+        top.addView(k.text(label, 15f, Colors.TEXT, true), k.lp(0, -2, weight = 1f))
+        top.addView(value)
+        c.addView(top)
+        val row = LinearLayout(k.ctx)
+        row.orientation = LinearLayout.HORIZONTAL
+        row.gravity = Gravity.CENTER_VERTICAL
+        row.addView(k.icon(icon, Colors.GREEN, 20))
+        row.addView(seek, k.lp(0, -2, left = 8, weight = 1f))
+        c.addView(row, k.lp(top = 8))
+        return c
+    }
+
+    init {
+        root.orientation = LinearLayout.VERTICAL
+        styleSeek(volSeek)
+        styleSeek(micSeek)
+        volSeek.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+            override fun onProgressChanged(s: SeekBar?, p: Int, fromUser: Boolean) {
+                volValue.text = "$p%"
+                if (fromUser) host.setVolume(p)
+            }
+            override fun onStartTrackingTouch(s: SeekBar?) {}
+            override fun onStopTrackingTouch(s: SeekBar?) {}
+        })
+        micSeek.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+            override fun onProgressChanged(s: SeekBar?, p: Int, fromUser: Boolean) {
+                micValue.text = "$p%"
+                if (fromUser) engine.setMicPercent(p)
+            }
+            override fun onStartTrackingTouch(s: SeekBar?) {}
+            override fun onStopTrackingTouch(s: SeekBar?) {}
+        })
+        root.addView(control(R.drawable.ic_speaker, "Volume do altifalante", volValue, volSeek), k.lp(bottom = 12))
+        root.addView(control(R.drawable.ic_mic, "Microfone", micValue, micSeek), k.lp(bottom = 4))
+        root.addView(k.muted("No microfone, 50% é o ganho normal e 100% duplica o nível.", 12f), k.lp(bottom = 12))
+
+        val out = k.card()
+        out.addView(k.text("Saída de áudio", 15f, Colors.TEXT, true))
+        val pick = LinearLayout(k.ctx)
+        pick.orientation = LinearLayout.HORIZONTAL
+        pick.gravity = Gravity.CENTER_VERTICAL
+        pick.background = k.shape(Colors.SURFACE, 12, Colors.STROKE, 1)
+        pick.setPadding(k.dp(14), k.dp(12), k.dp(14), k.dp(12))
+        pick.addView(outValue, k.lp(0, -2, weight = 1f))
+        val arrow = k.icon(R.drawable.ic_chevron, Colors.MUTED, 18)
+        arrow.rotation = 90f
+        pick.addView(arrow)
+        pick.setOnClickListener { chooseOutput() }
+        out.addView(pick, k.lp(top = 10))
+        root.addView(out, k.lp(bottom = 12))
+
+        val info = k.card()
+        info.addView(k.sectionTitle(R.drawable.ic_info, "Qualidade"))
+        info.addView(k.kv("Codec", "G.711 µ-law"), k.lp(top = 10))
+        info.addView(k.kv("Taxa Wi-Fi / Bluetooth", "16 kHz / 8 kHz"), k.lp(top = 6))
+        info.addView(k.kv("Cifra", "AES-256-GCM"), k.lp(top = 6))
+        root.addView(info)
+    }
+
+    private fun chooseOutput() {
+        val items = arrayOf("Altifalante do telemóvel", "Auricular")
+        AlertDialog.Builder(k.ctx, android.R.style.Theme_Material_Dialog_Alert)
+            .setTitle("Saída de áudio")
+            .setSingleChoiceItems(items, if (engine.defaultSpeaker) 0 else 1) { d, which ->
+                val sp = which == 0
+                engine.setDefaultSpeaker(sp)
+                if (engine.state == CallEngine.State.ACTIVE && engine.speaker != sp) engine.toggleSpeaker()
+                d.dismiss()
+                refresh()
+            }
+            .show()
+    }
+
+    override fun refresh() {
+        if (!volSeek.isPressed) { volSeek.progress = host.getVolume(); volValue.text = "${volSeek.progress}%" }
+        if (!micSeek.isPressed) { micSeek.progress = engine.micPercent; micValue.text = "${engine.micPercent}%" }
+        outValue.text = if (engine.defaultSpeaker) "Altifalante do telemóvel" else "Auricular"
+    }
+}
+
+/** Separador Estado: informações da ligação. */
+class ClientStatusSection(private val k: Kit, private val engine: CallEngine) : Section() {
+    private val root = LinearLayout(k.ctx)
+    private val vServer = k.text("", 15f, Colors.GREEN, true)
+    private val vType = k.text("", 15f, Colors.TEXT, true)
+    private val vIp = k.text("", 15f, Colors.TEXT, true)
+    private val vSignal = k.text("", 15f, Colors.TEXT, true)
+    private val vTime = k.text("", 15f, Colors.TEXT, true)
+    override val view: View get() = root
+    override val live: Boolean get() = true
+
+    init {
+        root.orientation = LinearLayout.VERTICAL
+        root.addView(k.infoRow(R.drawable.ic_server, "Servidor", vServer), k.lp(bottom = 10))
+        root.addView(k.infoRow(R.drawable.ic_wifi, "Tipo de ligação", vType), k.lp(bottom = 10))
+        root.addView(k.infoRow(R.drawable.ic_device, "IP local", vIp), k.lp(bottom = 10))
+        root.addView(k.infoRow(R.drawable.ic_bars, "Força do sinal", vSignal), k.lp(bottom = 10))
+        root.addView(k.infoRow(R.drawable.ic_clock, "Tempo de ligação", vTime))
+    }
+
+    override fun refresh() {
+        val s = engine.selectedServerPeer()
+        vServer.text = if (s != null) "Conectado" else if (engine.serverId != null) "Fora de alcance" else "Desligado"
+        vServer.setTextColor(if (s != null) Colors.GREEN else Colors.AMBER)
+        vType.text = if (s != null) viaLabel(s) else engine.networkLabel()
+        vIp.text = engine.lan.primaryIp()
+        vSignal.text = engine.wifiSignal()
+        val t = engine.serverLinkSeconds()
+        vTime.text = if (t >= 0) formatHms(t) else "-"
     }
 }

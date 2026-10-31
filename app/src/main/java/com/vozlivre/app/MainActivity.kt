@@ -5,6 +5,7 @@ import android.animation.ObjectAnimator
 import android.animation.PropertyValuesHolder
 import android.animation.ValueAnimator
 import android.app.Activity
+import android.app.AlertDialog
 import android.bluetooth.BluetoothAdapter
 import android.content.Context
 import android.content.Intent
@@ -34,7 +35,7 @@ import android.widget.Toast
 class MainActivity : Activity(), CallEngine.Ui, Host {
 
     private class Tab(val icon: Int, val label: String, val screen: Screen)
-    private class NavItem(val icon: ImageView, val label: TextView, val indicator: View)
+    private class NavItem(val item: LinearLayout, val holder: FrameLayout, val icon: ImageView, val label: TextView)
 
     private companion object { const val REQ_ENABLE_BT = 21 }
 
@@ -48,11 +49,13 @@ class MainActivity : Activity(), CallEngine.Ui, Host {
     private val navItems = ArrayList<NavItem>()
     private var body: FrameLayout? = null
     private var current = 0
-    private var logSection: LogSection? = null
+    private var subScreen: Screen? = null
+    private val mainLogs = ArrayList<LogSection>()
+    private val subLogs = ArrayList<LogSection>()
+    private var buildingShell = false
     private var logPending = false
-
-    private var headerDot: View? = null
-    private var headerStatus: TextView? = null
+    private var callBar: TextView? = null
+    private var lastState = CallEngine.State.IDLE
 
     private val pending = HashMap<Int, () -> Unit>()
     private var reqCode = 100
@@ -60,9 +63,10 @@ class MainActivity : Activity(), CallEngine.Ui, Host {
     // chamada
     private lateinit var callLayer: LinearLayout
     private lateinit var ring: View
-    private lateinit var avatar: TextView
+    private lateinit var callTop: TextView
+    private lateinit var callTimer: TextView
     private lateinit var callName: TextView
-    private lateinit var callStatus: TextView
+    private lateinit var callIp: TextView
     private lateinit var toolsRow: LinearLayout
     private lateinit var incomingRow: LinearLayout
     private lateinit var hangCol: LinearLayout
@@ -78,7 +82,7 @@ class MainActivity : Activity(), CallEngine.Ui, Host {
         engine = (application as VozApp).engine
         k = Kit(this)
         root = FrameLayout(this)
-        root.setBackgroundColor(Colors.BG)
+        root.background = GradientDrawable(GradientDrawable.Orientation.TOP_BOTTOM, intArrayOf(0xFF04160D.toInt(), Colors.BG))
         buildOverlay()
         setContentView(root)
         engine.start()
@@ -92,9 +96,10 @@ class MainActivity : Activity(), CallEngine.Ui, Host {
     override fun onStart() {
         super.onStart()
         engine.ui = this
-        refreshHeader()
         onStateChanged()
-        screens.getOrNull(current)?.refresh()
+        currentScreen()?.refresh()
+        handler.removeCallbacks(ticker)
+        handler.postDelayed(ticker, 1000)
     }
 
     override fun onStop() {
@@ -144,7 +149,7 @@ class MainActivity : Activity(), CallEngine.Ui, Host {
             else toast("Permissão necessária não concedida")
         }
         if (allGranted(btPerms())) engine.startBluetooth()
-        screens.getOrNull(current)?.refresh()
+        currentScreen()?.refresh()
     }
 
     @Deprecated("Deprecated in Java")
@@ -154,7 +159,7 @@ class MainActivity : Activity(), CallEngine.Ui, Host {
             engine.startBluetooth()
             engine.bt.startScan()
         }
-        screens.getOrNull(current)?.refresh()
+        currentScreen()?.refresh()
     }
 
     override fun scanBluetooth() {
@@ -197,6 +202,36 @@ class MainActivity : Activity(), CallEngine.Ui, Host {
 
     override fun goTo(index: Int) { select(index) }
 
+    override fun registerLog(s: LogSection) { if (buildingShell) mainLogs.add(s) else subLogs.add(s) }
+
+    override fun openSub(title: String, icon: Int, sections: List<Section>) {
+        val b = body ?: return
+        val header = StaticSection(k.titleHeader(icon, title) { closeSub() })
+        val sc = Screen(k, listOf<Section>(header) + sections)
+        subScreen = sc
+        b.removeAllViews()
+        b.addView(sc.view, FrameLayout.LayoutParams(-1, -1))
+        sc.refresh()
+    }
+
+    private fun closeSub() {
+        subScreen = null
+        subLogs.clear()
+        val b = body ?: return
+        b.removeAllViews()
+        screens.getOrNull(current)?.let {
+            b.addView(it.view, FrameLayout.LayoutParams(-1, -1))
+            it.refresh()
+        }
+    }
+
+    private fun currentScreen(): Screen? = subScreen ?: screens.getOrNull(current)
+
+    @Deprecated("Deprecated in Java")
+    override fun onBackPressed() {
+        if (subScreen != null) closeSub() else super.onBackPressed()
+    }
+
     override fun getVolume(): Int {
         val am = getSystemService(Context.AUDIO_SERVICE) as AudioManager
         val max = am.getStreamMaxVolume(AudioManager.STREAM_VOICE_CALL).coerceAtLeast(1)
@@ -213,13 +248,17 @@ class MainActivity : Activity(), CallEngine.Ui, Host {
 
     private fun showMain() {
         mainView?.let { root.removeView(it) }
-        logSection = null
+        mainLogs.clear(); subLogs.clear()
         navItems.clear()
         screens = emptyList()
+        subScreen = null
+        callBar = null
+        buildingShell = true
         val v = if (engine.mode == null) buildChooser() else buildShell()
+        buildingShell = false
         mainView = v
         root.addView(v, 0, FrameLayout.LayoutParams(-1, -1))
-        refreshHeader()
+        onStateChanged()
     }
 
     private fun buildChooser(): View {
@@ -228,12 +267,10 @@ class MainActivity : Activity(), CallEngine.Ui, Host {
         val col = LinearLayout(this)
         col.orientation = LinearLayout.VERTICAL
         col.gravity = Gravity.CENTER_HORIZONTAL
-        col.setPadding(k.dp(24), k.dp(56), k.dp(24), k.dp(24))
-
-        val sp = SpannableString("VozLivre")
-        sp.setSpan(ForegroundColorSpan(Colors.GREEN), 3, 8, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
-        col.addView(k.text(sp, 36f, Colors.TEXT, true))
-        col.addView(k.muted("Escolhe como vais usar esta app neste telemóvel.", 15f), k.lp(top = 8, bottom = 28))
+        col.setPadding(k.dp(24), k.dp(40), k.dp(24), k.dp(24))
+        val logo = LogoSection(k, "Comunicação local sem Internet")
+        col.addView(logo.view, k.lp(bottom = 12))
+        col.addView(k.muted("Escolhe como vais usar esta app neste telemóvel.", 15f), k.lp(bottom = 20))
 
         fun option(icon: Int, title: String, desc: String, mode: String) {
             val c = k.card(true)
@@ -241,7 +278,7 @@ class MainActivity : Activity(), CallEngine.Ui, Host {
             val top = LinearLayout(this)
             top.orientation = LinearLayout.HORIZONTAL
             top.gravity = Gravity.CENTER_VERTICAL
-            top.addView(k.icon(icon, Colors.GREEN, 30))
+            top.addView(k.iconCircle(icon, 44))
             top.addView(k.text(title, 20f, Colors.TEXT, true), k.lp(0, -2, left = 12, weight = 1f))
             c.addView(top)
             c.addView(k.muted(desc, 14f), k.lp(top = 10))
@@ -253,7 +290,7 @@ class MainActivity : Activity(), CallEngine.Ui, Host {
         }
         option(R.drawable.ic_server, "Servidor",
             "Painel de controlo completo: rede, clientes, chamadas, segurança, registos e definições avançadas.", "server")
-        option(R.drawable.ic_call, "Cliente",
+        option(R.drawable.ic_person, "Cliente",
             "Interface simples: liga ao servidor, faz chamadas e controla o áudio.", "client")
 
         col.addView(View(this), k.lp(-1, 0, weight = 1f))
@@ -266,10 +303,19 @@ class MainActivity : Activity(), CallEngine.Ui, Host {
         val server = engine.mode == "server"
         val col = LinearLayout(this)
         col.orientation = LinearLayout.VERTICAL
-        col.addView(buildHeader(server))
         val b = FrameLayout(this)
         body = b
         col.addView(b, LinearLayout.LayoutParams(-1, 0, 1f))
+        if (server) {
+            val bar = k.text("", 13f, Color.BLACK, true)
+            bar.gravity = Gravity.CENTER
+            bar.setPadding(k.dp(12), k.dp(8), k.dp(12), k.dp(8))
+            bar.background = k.shape(Colors.GREEN, 0)
+            bar.visibility = View.GONE
+            bar.setOnClickListener { select(2) }
+            callBar = bar
+            col.addView(bar)
+        }
         val tabs = if (server) serverTabs() else clientTabs()
         screens = tabs.map { it.screen }
         col.addView(buildNav(tabs))
@@ -278,53 +324,34 @@ class MainActivity : Activity(), CallEngine.Ui, Host {
         return col
     }
 
-    private fun serverTabs(): List<Tab> {
-        val log = LogSection(k, engine, this)
-        logSection = log
-        return listOf(
-            Tab(R.drawable.ic_wifi, "Ligações", Screen(k, listOf(
-                ServerOverviewSection(k, engine), NetworkSection(k, engine),
-                P2pSection(k, engine, this, true), BtSection(k, engine, this)))),
-            Tab(R.drawable.ic_people, "Clientes", Screen(k, listOf(ClientsSection(k, engine, this)))),
-            Tab(R.drawable.ic_call, "Chamadas", Screen(k, listOf(
-                QuickDialSection(k, engine, this), CallStatsSection(k, engine), HistorySection(k, engine, 30)))),
-            Tab(R.drawable.ic_pulse, "Diagnóstico", Screen(k, listOf(PeersTableSection(k, engine), log))),
-            Tab(R.drawable.ic_settings, "Definições", Screen(k, listOf(
-                IdentitySection(k, engine, this), PermissionsSection(k, this), BackgroundSection(k, engine, this),
-                AdvancedSection(k, engine, this), ModeSection(k, engine, this), CreditsSection(k))))
-        )
-    }
+    private fun header(icon: Int, title: String): Section = StaticSection(k.titleHeader(icon, title))
+
+    private fun serverTabs(): List<Tab> = listOf(
+        Tab(R.drawable.ic_wifi, "Ligações", Screen(k, listOf(
+            LogoSection(k, "Servidor"), ServerSessionSection(k, engine), ServerTilesSection(k, engine, this)))),
+        Tab(R.drawable.ic_people, "Clientes", Screen(k, listOf(
+            header(R.drawable.ic_people, "Clientes"), ClientsTabSection(k, engine, this)))),
+        Tab(R.drawable.ic_call, "Chamadas", Screen(k, listOf(
+            header(R.drawable.ic_call, "Chamadas"), CallsTabSection(k, engine, this)))),
+        Tab(R.drawable.ic_pulse, "Diagnóstico", Screen(k, listOf(
+            header(R.drawable.ic_pulse, "Diagnóstico"), ServerDiagnosticsSection(k, engine, this),
+            PeersTableSection(k, engine), LogSection(k, engine, this)))),
+        Tab(R.drawable.ic_settings, "Definições", Screen(k, listOf(
+            header(R.drawable.ic_settings, "Definições avançadas"), SettingsListSection(k, engine, this))))
+    )
 
     private fun clientTabs(): List<Tab> = listOf(
         Tab(R.drawable.ic_wifi, "Ligação", Screen(k, listOf(
-            ClientLinkStatusSection(k, engine, this), ServerListSection(k, engine, this),
+            LogoSection(k, "Cliente"), ClientConnectionSection(k, engine, this), ServerListSection(k, engine, this),
             OtherMethodsSection(k, engine, this), IdentitySection(k, engine, this)))),
         Tab(R.drawable.ic_call, "Chamadas", Screen(k, listOf(
-            CallServerSection(k, engine, this), HistorySection(k, engine, 10, "Chamadas recentes")))),
-        Tab(R.drawable.ic_speaker, "Áudio", Screen(k, listOf(AudioControlsSection(k, engine, this)))),
+            header(R.drawable.ic_call, "Chamadas"), ClientCallsSection(k, engine, this)))),
+        Tab(R.drawable.ic_speaker, "Áudio", Screen(k, listOf(
+            header(R.drawable.ic_speaker, "Áudio"), AudioSettingsSection(k, engine, this)))),
         Tab(R.drawable.ic_bars, "Estado", Screen(k, listOf(
-            ClientIndicatorsSection(k, engine, this), PermissionsSection(k, this), BackgroundSection(k, engine, this),
-            ModeSection(k, engine, this), CreditsSection(k))))
+            header(R.drawable.ic_bars, "Estado"), ClientStatusSection(k, engine), PermissionsSection(k, this),
+            BackgroundSection(k, engine, this), ModeSection(k, engine, this), CreditsSection(k))))
     )
-
-    private fun buildHeader(server: Boolean): View {
-        val h = LinearLayout(this)
-        h.orientation = LinearLayout.HORIZONTAL
-        h.gravity = Gravity.CENTER_VERTICAL
-        h.setPadding(k.dp(16), k.dp(14), k.dp(16), k.dp(8))
-        val sp = SpannableString("VozLivre")
-        sp.setSpan(ForegroundColorSpan(Colors.GREEN), 3, 8, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
-        h.addView(k.text(sp, 22f, Colors.TEXT, true))
-        h.addView(k.pill(if (server) "SERVIDOR" else "CLIENTE"), k.lp(-2, -2, left = 10))
-        h.addView(View(this), k.lp(0, 1, weight = 1f))
-        val d = k.dot(Colors.AMBER, 12)
-        headerDot = d
-        h.addView(d)
-        val st = k.text("", 12f, Colors.MUTED)
-        headerStatus = st
-        h.addView(st, k.lp(-2, -2, left = 8))
-        return h
-    }
 
     private fun buildNav(tabs: List<Tab>): View {
         val wrap = LinearLayout(this)
@@ -333,22 +360,21 @@ class MainActivity : Activity(), CallEngine.Ui, Host {
         wrap.addView(k.divider())
         val bar = LinearLayout(this)
         bar.orientation = LinearLayout.HORIZONTAL
+        bar.setPadding(k.dp(6), k.dp(6), k.dp(6), k.dp(6))
         for ((i, t) in tabs.withIndex()) {
             val item = LinearLayout(this)
             item.orientation = LinearLayout.VERTICAL
             item.gravity = Gravity.CENTER_HORIZONTAL
-            item.setPadding(0, k.dp(6), 0, k.dp(8))
-            val ind = View(this)
-            ind.background = k.shape(Colors.GREEN, 3)
-            k.glow(ind, Colors.GREEN, 4)
-            item.addView(ind, k.lp(k.dp(22), k.dp(3), bottom = 6))
-            val ic = k.icon(t.icon, Colors.MUTED, 22)
-            item.addView(ic)
+            item.setPadding(0, k.dp(6), 0, k.dp(6))
+            val holder = FrameLayout(this)
+            val ic = k.icon(t.icon, Colors.MUTED, 20)
+            holder.addView(ic, FrameLayout.LayoutParams(k.dp(20), k.dp(20), Gravity.CENTER))
+            item.addView(holder, k.lp(k.dp(34), k.dp(34)))
             val tx = k.text(t.label, 10.5f, Colors.MUTED)
-            item.addView(tx, k.lp(-2, -2, top = 3))
+            item.addView(tx, k.lp(-2, -2, top = 2))
             item.setOnClickListener { select(i) }
-            navItems.add(NavItem(ic, tx, ind))
-            bar.addView(item, k.lp(0, -2, weight = 1f))
+            navItems.add(NavItem(item, holder, ic, tx))
+            bar.addView(item, k.lp(0, -2, left = if (i > 0) 4 else 0, weight = 1f))
         }
         wrap.addView(bar)
         return wrap
@@ -358,44 +384,32 @@ class MainActivity : Activity(), CallEngine.Ui, Host {
         val b = body ?: return
         if (i < 0 || i >= screens.size) return
         current = i
+        subScreen = null
+        subLogs.clear()
         b.removeAllViews()
         b.addView(screens[i].view, FrameLayout.LayoutParams(-1, -1))
         for ((j, n) in navItems.withIndex()) {
             val sel = j == i
-            n.icon.setColorFilter(if (sel) Colors.GREEN else Colors.MUTED)
+            n.icon.setColorFilter(if (sel) Color.BLACK else Colors.MUTED)
+            n.holder.background = if (sel) circle(Colors.GREEN) else null
             n.label.setTextColor(if (sel) Colors.GREEN else Colors.MUTED)
-            n.indicator.visibility = if (sel) View.VISIBLE else View.INVISIBLE
+            n.item.background = if (sel) k.shape(Colors.alpha(Colors.GREEN, 0x12), 14, Colors.alpha(Colors.GREEN, 0x55), 1) else null
         }
         screens[i].refresh()
-    }
-
-    private fun refreshHeader() {
-        val d = headerDot ?: return
-        val s = headerStatus ?: return
-        if (engine.mode == "server") {
-            val up = engine.lan.hasLinks()
-            k.recolorDot(d, if (up) Colors.GREEN else Colors.AMBER)
-            s.text = if (up) "Ativo" else "Sem rede"
-        } else {
-            val ok = engine.selectedServerPeer() != null
-            k.recolorDot(d, if (ok) Colors.GREEN else Colors.AMBER)
-            s.text = if (ok) "Ligado" else "Sem servidor"
-        }
+        updateCallBar()
     }
 
     // ---------------------------------------------------------------- CallEngine.Ui
 
-    override fun onPeersChanged() {
-        refreshHeader()
-        screens.getOrNull(current)?.refresh()
-    }
+    override fun onPeersChanged() { currentScreen()?.refresh() }
 
     override fun onLog() {
         if (logPending) return
         logPending = true
         handler.postDelayed({
             logPending = false
-            logSection?.refresh()
+            for (l in mainLogs) l.refresh()
+            for (l in subLogs) l.refresh()
         }, 400)
     }
 
@@ -403,10 +417,12 @@ class MainActivity : Activity(), CallEngine.Ui, Host {
 
     override fun onStateChanged() {
         val st = engine.state
-        callLayer.visibility = if (st == CallEngine.State.IDLE) View.GONE else View.VISIBLE
+        val server = engine.mode == "server"
+        val showOverlay = st == CallEngine.State.INCOMING || st == CallEngine.State.OUTGOING || (st == CallEngine.State.ACTIVE && !server)
+        callLayer.visibility = if (showOverlay) View.VISIBLE else View.GONE
         val p = engine.peer
         callName.text = p?.name ?: ""
-        avatar.text = p?.name?.trim()?.firstOrNull()?.uppercase() ?: "?"
+        callIp.text = if (p == null) "" else if (p.detail.isNotEmpty()) p.detail else viaLabel(p)
         incomingRow.visibility = if (st == CallEngine.State.INCOMING) View.VISIBLE else View.GONE
         hangCol.visibility = if (st == CallEngine.State.OUTGOING || st == CallEngine.State.ACTIVE) View.VISIBLE else View.GONE
         toolsRow.visibility = if (st == CallEngine.State.ACTIVE) View.VISIBLE else View.GONE
@@ -416,10 +432,23 @@ class MainActivity : Activity(), CallEngine.Ui, Host {
         (speakerBtn.tag as ImageView).setColorFilter(if (engine.speaker) Color.BLACK else Colors.TEXT)
         updateCallText()
         setPulse(st == CallEngine.State.OUTGOING || st == CallEngine.State.INCOMING)
-        handler.removeCallbacks(ticker)
-        if (st == CallEngine.State.ACTIVE) handler.postDelayed(ticker, 1000)
-        refreshHeader()
-        screens.getOrNull(current)?.refresh()
+        if (server && st == CallEngine.State.ACTIVE && lastState != CallEngine.State.ACTIVE) select(2)
+        lastState = st
+        updateCallBar()
+        currentScreen()?.refresh()
+    }
+
+    private fun updateCallBar() {
+        val bar = callBar ?: return
+        val p = engine.peer
+        val away = current != 2 || subScreen != null
+        if (engine.state == CallEngine.State.ACTIVE && p != null && away) {
+            val s = ((SystemClock.elapsedRealtime() - engine.activeSince) / 1000).toInt()
+            bar.text = "Em chamada com ${p.name} • ${formatSeconds(s)}  (toca para abrir)"
+            bar.visibility = View.VISIBLE
+        } else {
+            bar.visibility = View.GONE
+        }
     }
 
     // ---------------------------------------------------------------- ecrã de chamada
@@ -462,34 +491,43 @@ class MainActivity : Activity(), CallEngine.Ui, Host {
         callLayer = LinearLayout(this)
         callLayer.orientation = LinearLayout.VERTICAL
         callLayer.gravity = Gravity.CENTER_HORIZONTAL
-        callLayer.setBackgroundColor(Colors.BG)
-        callLayer.setPadding(k.dp(24), k.dp(64), k.dp(24), k.dp(56))
+        callLayer.background = GradientDrawable(GradientDrawable.Orientation.TOP_BOTTOM, intArrayOf(0xFF04160D.toInt(), Colors.BG))
+        callLayer.setPadding(k.dp(24), k.dp(48), k.dp(24), k.dp(48))
         callLayer.visibility = View.GONE
         callLayer.isClickable = true
+
+        callTop = k.text("", 17f, Colors.TEXT, true)
+        callTop.gravity = Gravity.CENTER
+        callTimer = k.text("00:00:00", 30f, Colors.TEXT, true)
+        callTimer.gravity = Gravity.CENTER
+        callLayer.addView(callTop)
+        callLayer.addView(callTimer, k.lp(top = 4))
 
         val ringBox = FrameLayout(this)
         ring = View(this)
         ring.background = k.shape(Colors.alpha(Colors.GREEN, 0x10), 200, Colors.alpha(Colors.GREEN, 0x55), 2)
         ringBox.addView(ring, FrameLayout.LayoutParams(k.dp(190), k.dp(190), Gravity.CENTER))
-        avatar = k.avatar("?", 120)
-        avatar.textSize = 48f
-        ringBox.addView(avatar, FrameLayout.LayoutParams(k.dp(120), k.dp(120), Gravity.CENTER))
-        callLayer.addView(ringBox, LinearLayout.LayoutParams(k.dp(190), k.dp(190)))
+        val av = k.iconCircle(R.drawable.ic_person, 120)
+        k.glow(av, Colors.GREEN, 10)
+        ringBox.addView(av, FrameLayout.LayoutParams(k.dp(120), k.dp(120), Gravity.CENTER))
+        callLayer.addView(ringBox, k.lp(k.dp(190), k.dp(190), top = 28))
 
-        callName = k.text("", 28f, Colors.TEXT, true)
+        callName = k.text("", 24f, Colors.TEXT, true)
         callName.gravity = Gravity.CENTER
-        callStatus = k.text("", 17f, Colors.GREEN)
-        callStatus.gravity = Gravity.CENTER
-        callLayer.addView(callName, k.lp(top = 20))
-        callLayer.addView(callStatus, k.lp(top = 8))
+        callIp = k.muted("", 15f)
+        callIp.gravity = Gravity.CENTER
+        callLayer.addView(callName, k.lp(top = 16))
+        callLayer.addView(callIp, k.lp(top = 4))
         callLayer.addView(View(this), k.lp(-1, 0, weight = 1f))
 
         muteBtn = round(R.drawable.ic_mic, Colors.CARD_HI, tint = Colors.TEXT) { engine.toggleMute() }
         speakerBtn = round(R.drawable.ic_speaker, Colors.CARD_HI, tint = Colors.TEXT) { engine.toggleSpeaker() }
+        val moreBtn = round(R.drawable.ic_more, Colors.CARD_HI, tint = Colors.TEXT) { showMore() }
         toolsRow = LinearLayout(this)
         toolsRow.orientation = LinearLayout.HORIZONTAL
-        toolsRow.addView(labeled(muteBtn, "Silenciar", 1f))
+        toolsRow.addView(labeled(muteBtn, "Microfone", 1f))
         toolsRow.addView(labeled(speakerBtn, "Altifalante", 1f))
+        toolsRow.addView(labeled(moreBtn, "Mais", 1f))
         callLayer.addView(toolsRow, k.lp(bottom = 28))
 
         val reject = round(R.drawable.ic_call, Colors.RED, 135f, glow = true) { engine.reject() }
@@ -505,6 +543,23 @@ class MainActivity : Activity(), CallEngine.Ui, Host {
         callLayer.addView(hangCol)
 
         root.addView(callLayer, FrameLayout.LayoutParams(-1, -1))
+    }
+
+    private fun showMore() {
+        val items = arrayOf("Aumentar volume", "Diminuir volume", "Detalhes da ligação")
+        AlertDialog.Builder(this, android.R.style.Theme_Material_Dialog_Alert)
+            .setTitle("Mais opções")
+            .setItems(items) { _, which ->
+                when (which) {
+                    0 -> setVolume((getVolume() + 10).coerceAtMost(100))
+                    1 -> setVolume((getVolume() - 10).coerceAtLeast(0))
+                    else -> {
+                        val p = engine.peer
+                        toast(if (p == null) "Sem chamada" else "${p.name} · ${viaLabel(p)} · ${p.detail}")
+                    }
+                }
+            }
+            .show()
     }
 
     private fun setPulse(on: Boolean) {
@@ -532,16 +587,21 @@ class MainActivity : Activity(), CallEngine.Ui, Host {
     private val ticker = object : Runnable {
         override fun run() {
             updateCallText()
-            if (engine.state == CallEngine.State.ACTIVE) handler.postDelayed(this, 1000)
+            updateCallBar()
+            currentScreen()?.refreshLive()
+            handler.postDelayed(this, 1000)
         }
     }
 
     private fun updateCallText() {
         if (engine.state == CallEngine.State.ACTIVE) {
             val s = ((SystemClock.elapsedRealtime() - engine.activeSince) / 1000).toInt()
-            callStatus.text = "Em chamada  " + formatSeconds(s)
+            callTop.text = "Chamada em curso"
+            callTimer.text = formatHms(s)
+            callTimer.visibility = View.VISIBLE
         } else {
-            callStatus.text = engine.statusText
+            callTop.text = engine.statusText
+            callTimer.visibility = View.GONE
         }
     }
 }

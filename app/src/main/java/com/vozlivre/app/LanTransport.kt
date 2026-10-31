@@ -50,6 +50,7 @@ class LanTransport(
         @Volatile var control: DatagramSocket? = null
         @Volatile var audio: DatagramSocket? = null
         val key: String get() = ifName + "/" + addr.hostAddress
+        fun isP2pLink(): Boolean = ifName.startsWith("p2p")
         fun contains(a: InetAddress): Boolean = (ipInt2(a) and mask) == (ipInt and mask)
     }
 
@@ -112,6 +113,13 @@ class LanTransport(
     fun probeAddress(a: InetAddress) { probeQueue.add(a); gate.release() }
 
     fun hasLinks(): Boolean = links.isNotEmpty()
+
+    fun hasP2pLink(): Boolean = links.values.any { it.isP2pLink() }
+
+    fun primaryIp(): String {
+        val l = links.values.sortedBy { if (it.ifName.startsWith("p2p")) 0 else 1 }.firstOrNull()
+        return l?.addr?.hostAddress ?: "-"
+    }
 
     fun describeLinks(): String {
         if (links.isEmpty()) return "Sem rede local ativa"
